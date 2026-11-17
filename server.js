@@ -16,7 +16,7 @@ import { badRequest, parseId, rateLimit } from "./util.js";
 // SETTINGS
 // --------------------------------------------------
 
-const HOST = process.env.HOST || "127.0.0.1"; // 127.0.0.1 = only this computer
+const HOST = process.env.HOST || "0.0.0.0"; // 127.0.0.1 = only this computer
 const PORT = Number(process.env.PORT || 4000);
 const MAX_QTY = 100;
 const MAX_MESSAGE_CHARS = 2000;
