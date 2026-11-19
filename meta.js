@@ -113,6 +113,21 @@ if (!db.prepare("PRAGMA table_info(meta_connections)").all().some(c => c.name ==
 }
 db.exec("CREATE INDEX IF NOT EXISTS idx_meta_conn_fbuser ON meta_connections(fb_user_id)");
 
+// Automatic order detection: where each conversation stands.
+//   auto_status  '' | 'order_created' | 'needs_review' | 'not_order'
+//   order_cutoff last customer message already used for an order (the next order starts after it)
+{
+  const have = db.prepare("PRAGMA table_info(meta_threads)").all().map(c => c.name);
+  for (const [name, definition] of [
+    ["auto_status", "TEXT NOT NULL DEFAULT ''"],
+    ["auto_note", "TEXT NOT NULL DEFAULT ''"],
+    ["order_id", "INTEGER"],
+    ["order_cutoff", "INTEGER NOT NULL DEFAULT 0"]
+  ]) {
+    if (!have.includes(name)) db.exec(`ALTER TABLE meta_threads ADD COLUMN ${name} ${definition}`);
+  }
+}
+
 db.prepare("DELETE FROM meta_oauth_states WHERE expires_at < ?").run(Date.now());
 
 // --------------------------------------------------
@@ -482,6 +497,153 @@ const storeMessage = db.transaction((connection, customerId, mid, direction, tex
   return thread;
 });
 
+// --------------------------------------------------
+// AUTOMATIC ORDER DETECTION
+// When a customer writes, wait until they stop typing, run the same AI extraction as the AI Inbox,
+// and save the order if everything the server requires is there. Otherwise mark the conversation
+// "needs review" so the seller finishes it. server.js supplies the real order saver
+// (same validation, same duplicate check as a manual order) through setAutoOrderHandler.
+//
+//   META_AUTO_ORDERS=0            turns this off
+//   META_AUTO_DELAY_MS            quiet time before analysing (default 15000)
+//   META_AUTO_MIN_CONFIDENCE      below this the order goes to review (default 0.6)
+//   META_AUTO_REQUIRE_ADDRESS=1   also require a street address (default: city + phone + name are enough)
+// --------------------------------------------------
+
+let autoOrderHandler = null;
+export const setAutoOrderHandler = fn => { autoOrderHandler = fn; };
+
+const autoTimers = new Map(); // thread id -> timer
+
+function scheduleAutoOrder(threadId) {
+  if (!autoOrderHandler || process.env.META_AUTO_ORDERS === "0") return;
+
+  clearTimeout(autoTimers.get(threadId));
+
+  const delay = Number(process.env.META_AUTO_DELAY_MS ?? 15_000);
+
+  autoTimers.set(threadId, setTimeout(() => {
+    autoTimers.delete(threadId);
+    autoProcessThread(threadId).catch(error => console.error("Auto order error:", error.message));
+  }, delay));
+}
+
+const SOURCE_NAME = { facebook: "Facebook", instagram: "Instagram" };
+
+// Returns { status, note, body? } : body is ready to be saved as an order.
+function decideAutoOrder(result, thread, platform, text) {
+  const items = (result.items || []).filter(item => item.product);
+  const intent = result.customer_intent;
+
+  // No product, or the customer is only asking a question / complaining: not an order.
+  if (!items.length || intent === "question" || intent === "complaint") return { status: "not_order", note: "" };
+
+  const extracted = result.extracted || {};
+  const name = extracted.customer_name || thread.customer_name || "";
+  const problems = [];
+
+  if (intent !== "new_order") problems.push("unclear whether this is an order");
+
+  if (result.provider === "rules") problems.push("AI offline: verify manually");
+
+  const minConfidence = Number(process.env.META_AUTO_MIN_CONFIDENCE ?? 0.6);
+  if (result.confidence != null && result.confidence < minConfidence) problems.push("low confidence");
+
+  // The Facebook / Instagram profile name replaces a name the AI could not find.
+  // The address is optional for an order (like the order form), unless META_AUTO_REQUIRE_ADDRESS=1.
+  const requireAddress = process.env.META_AUTO_REQUIRE_ADDRESS === "1";
+
+  const missing = (result.missing || []).filter(field =>
+    !(name && /name/i.test(String(field))) && (requireAddress || field !== "address")
+  );
+  if (requireAddress && !extracted.address && !missing.includes("address")) missing.push("address");
+  if (missing.length) problems.push(`missing: ${missing.join(", ")}`);
+
+  if (items.some(item => item.in_catalog === false)) problems.push("product not in catalog");
+  if (items.some(item => !(Number(item.unit_price) > 0))) problems.push("product without a price");
+
+  if (problems.length) return { status: "needs_review", note: problems.join(" · ") };
+
+  return {
+    status: "order_created",
+    note: "",
+    body: {
+      customer_name: name,
+      phone: extracted.phone || "",
+      city: extracted.city || "",
+      address: extracted.address || "",
+      items: items.map(item => ({
+        product: item.product,
+        variant: item.variant || "",
+        color: item.color || "",
+        size: item.size || "",
+        quantity: item.quantity || 1,
+        unit_price: item.unit_price || 0
+      })),
+      source: SOURCE_NAME[platform] || "manual",
+      message: text.slice(0, 4000)
+    }
+  };
+}
+
+async function autoProcessThread(threadId) {
+  const thread = db.prepare("SELECT * FROM meta_threads WHERE id = ?").get(threadId);
+  if (!thread) return;
+
+  const connection = db.prepare("SELECT * FROM meta_connections WHERE id = ?").get(thread.connection_id);
+  if (!connection) return;
+
+  // Only customer messages that are not already part of a saved order.
+  const rows = db.prepare(
+    "SELECT id, text FROM meta_messages WHERE thread_id = ? AND direction = 'in' AND id > ? ORDER BY id DESC LIMIT 10"
+  ).all(thread.id, thread.order_cutoff || 0).reverse();
+
+  if (!rows.length) return;
+
+  const text = rows.map(row => row.text).join("\n").slice(-2000);
+  const uid = connection.user_id;
+
+  const products = db.prepare("SELECT id, name, price, aliases FROM products WHERE user_id = ? ORDER BY name").all(uid);
+
+  let result;
+  try {
+    result = await analyzeMessage(text, { products });
+  } catch (error) {
+    console.error("Auto order: AI analysis failed:", error.message);
+    return;
+  }
+
+  let { status, note, body } = decideAutoOrder(result, thread, connection.platform, text);
+  let orderId = null;
+
+  if (status === "order_created") {
+    const saved = autoOrderHandler(uid, body);
+
+    if (saved.ok) {
+      orderId = saved.order_id;
+    } else {
+      status = "needs_review";
+      note = saved.duplicate_id
+        ? `possible duplicate of order #${String(saved.duplicate_id).padStart(4, "0")}`
+        : saved.reason || "could not save";
+    }
+  }
+
+  // A thank-you after a saved order is not a new "not an order": keep the order badge.
+  if (status === "not_order" && thread.auto_status === "order_created") return;
+
+  if (status === "order_created") {
+    db.prepare("UPDATE meta_threads SET auto_status = ?, auto_note = '', order_id = ?, order_cutoff = ? WHERE id = ?")
+      .run(status, orderId, rows[rows.length - 1].id, thread.id);
+    emit(uid, { type: "order_created", thread_id: thread.id, order_id: orderId });
+  } else {
+    db.prepare("UPDATE meta_threads SET auto_status = ?, auto_note = ? WHERE id = ?").run(status, note, thread.id);
+  }
+
+  emit(uid, { type: "thread_updated", thread_id: thread.id });
+  console.log(`Auto order: thread ${thread.id} -> ${status}${orderId ? ` #${orderId}` : ""}${note ? ` (${note})` : ""}`);
+}
+
 export function processWebhook(payload) {
   const platform = payload?.object === "instagram" ? "instagram" : payload?.object === "page" ? "facebook" : null;
   if (!platform) return;
@@ -521,6 +683,7 @@ export function processWebhook(payload) {
       if (thread) {
         emit(connection.user_id, { type: "message", thread_id: thread.id, direction: isEcho ? "out" : "in" });
         if (!thread.customer_name) fetchCustomerName(connection, thread).catch(() => {});
+        if (!isEcho) scheduleAutoOrder(thread.id);
       }
     }
   }
@@ -604,7 +767,8 @@ metaRouter.get("/threads", (req, res) => {
 
   const rows = db.prepare(`
     SELECT t.id, t.connection_id, c.platform, c.name AS account_name, t.customer_id, t.customer_name,
-           t.last_message, t.last_message_at, t.last_inbound_at, t.unread
+           t.last_message, t.last_message_at, t.last_inbound_at, t.unread,
+           t.auto_status, t.auto_note, t.order_id
     FROM meta_threads t JOIN meta_connections c ON c.id = t.connection_id
     WHERE t.user_id = ? ${connectionId ? "AND t.connection_id = ?" : ""}
     ORDER BY t.last_message_at DESC LIMIT ?
