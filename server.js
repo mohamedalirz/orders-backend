@@ -8,7 +8,7 @@ import "dotenv/config";
 import { db } from "./db.js";
 import { authRouter, requireAuth } from "./auth.js";
 import { analyzeMessage } from "./ai.js";
-import { metaPublicRouter, metaRouter } from "./meta.js";
+import { metaPublicRouter, metaRouter, setAutoOrderHandler } from "./meta.js";
 import { normalizePhone, isValidTnPhone } from "./tunisia.js";
 import { badRequest, parseId, rateLimit } from "./util.js";
 
@@ -250,6 +250,28 @@ function findDuplicate(uid, phone, items) {
     ORDER BY id DESC LIMIT 1
   `).get(uid, phone, summary.product, summary.quantity);
 }
+
+// Orders detected automatically from Facebook / Instagram messages (see meta.js).
+// Same validation and same duplicate check as an order created by hand.
+setAutoOrderHandler((uid, body) => {
+  const parsed = createSchema.safeParse(withLegacyItems(body));
+
+  if (!parsed.success) {
+    return { ok: false, reason: parsed.error.issues.map(issue => issue.message).join("; ") };
+  }
+
+  const items = prepareItems(parsed.data.items);
+  const duplicate = findDuplicate(uid, parsed.data.phone, items);
+
+  if (duplicate) return { ok: false, duplicate_id: duplicate.id };
+
+  try {
+    return { ok: true, order_id: createOrderTransaction(uid, parsed.data, items) };
+  } catch (error) {
+    console.error("Auto order save error:", error);
+    return { ok: false, reason: "could not save" };
+  }
+});
 
 // --------------------------------------------------
 // ORDERS
