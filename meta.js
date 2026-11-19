@@ -122,7 +122,8 @@ db.exec("CREATE INDEX IF NOT EXISTS idx_meta_conn_fbuser ON meta_connections(fb_
     ["auto_status", "TEXT NOT NULL DEFAULT ''"],
     ["auto_note", "TEXT NOT NULL DEFAULT ''"],
     ["order_id", "INTEGER"],
-    ["order_cutoff", "INTEGER NOT NULL DEFAULT 0"]
+    ["order_cutoff", "INTEGER NOT NULL DEFAULT 0"],
+    ["last_auto_reply", "TEXT NOT NULL DEFAULT ''"]
   ]) {
     if (!have.includes(name)) db.exec(`ALTER TABLE meta_threads ADD COLUMN ${name} ${definition}`);
   }
@@ -497,6 +498,25 @@ const storeMessage = db.transaction((connection, customerId, mid, direction, tex
   return thread;
 });
 
+// Sends a text to a customer through the Page / Instagram account and stores it as an outgoing message.
+async function sendText(connection, thread, text) {
+  const sent = await graph(`/${connection.page_id}/messages`, {
+    method: "POST",
+    token: decrypt(connection.token_enc),
+    body: {
+      recipient: { id: thread.customer_id },
+      messaging_type: "RESPONSE",
+      message: { text }
+    }
+  });
+
+  // Saved with Meta's message id, so the "echo" webhook that follows is recognised as a duplicate.
+  storeMessage(connection, thread.customer_id, sent.message_id, "out", text, Date.now());
+  emit(connection.user_id, { type: "message", thread_id: thread.id, direction: "out" });
+
+  return sent;
+}
+
 // --------------------------------------------------
 // AUTOMATIC ORDER DETECTION
 // When a customer writes, wait until they stop typing, run the same AI extraction as the AI Inbox,
@@ -507,6 +527,7 @@ const storeMessage = db.transaction((connection, customerId, mid, direction, tex
 //   META_AUTO_ORDERS=0            turns this off
 //   META_AUTO_DELAY_MS            quiet time before analysing (default 15000)
 //   META_AUTO_MIN_CONFIDENCE      below this the order goes to review (default 0.6)
+//   META_AUTO_REPLY=0             saves orders but does not answer customers (default: answers)
 //   META_AUTO_REQUIRE_ADDRESS=1   also require a street address (default: city + phone + name are enough)
 // --------------------------------------------------
 
@@ -514,6 +535,7 @@ let autoOrderHandler = null;
 export const setAutoOrderHandler = fn => { autoOrderHandler = fn; };
 
 const autoTimers = new Map(); // thread id -> timer
+const autoRunning = new Set(); // conversations being analysed right now
 
 function scheduleAutoOrder(threadId) {
   if (!autoOrderHandler || process.env.META_AUTO_ORDERS === "0") return;
@@ -522,10 +544,64 @@ function scheduleAutoOrder(threadId) {
 
   const delay = Number(process.env.META_AUTO_DELAY_MS ?? 15_000);
 
-  autoTimers.set(threadId, setTimeout(() => {
+  const run = () => {
     autoTimers.delete(threadId);
-    autoProcessThread(threadId).catch(error => console.error("Auto order error:", error.message));
-  }, delay));
+
+    // A new message arrived while the AI was still working on this conversation: wait for it to finish.
+    if (autoRunning.has(threadId)) {
+      autoTimers.set(threadId, setTimeout(run, Math.min(2000, delay)));
+      return;
+    }
+
+    autoRunning.add(threadId);
+    autoProcessThread(threadId)
+      .catch(error => console.error("Auto order error:", error.message))
+      .finally(() => autoRunning.delete(threadId));
+  };
+
+  autoTimers.set(threadId, setTimeout(run, delay));
+}
+
+// Customer-facing messages (Tunisian Derja, like the AI's own suggested replies).
+const ASK_LABELS = {
+  customer_name: "الإسم",
+  phone: "نمرة التليفون",
+  city: "الولاية / المدينة",
+  address: "العنوان",
+  product: "المنتج"
+};
+
+const askText = fields =>
+  `مرحبا 👋 باش نكمل الطلبية متاعك نحتاج:\n${fields.map(f => `- ${ASK_LABELS[f] || f}`).join("\n")}\nبرشا شكرا!`;
+
+function confirmationText(body, orderId) {
+  const lines = body.items
+    .map(item => `- ${item.product}${item.variant ? ` (${item.variant})` : ""} × ${item.quantity}`)
+    .join("\n");
+  const total = Number(body.items.reduce((sum, item) => sum + item.quantity * item.unit_price, 0).toFixed(3));
+
+  return `✅ طلبيتك تسجّلت (#${String(orderId).padStart(4, "0")})\n${lines}\nالمجموع: ${total} د.ت\nباش نعيطولك قريب للتأكيد. شكرا برشا 🙏`;
+}
+
+// Never lets a failed reply break the order that was already saved.
+async function autoReply(connection, threadId, text) {
+  if (process.env.META_AUTO_REPLY === "0") return;
+
+  const thread = db.prepare("SELECT * FROM meta_threads WHERE id = ?").get(threadId);
+  const current = db.prepare("SELECT status FROM meta_connections WHERE id = ?").get(connection.id);
+
+  if (!thread || current?.status !== "active") return;
+  if (Date.now() - thread.last_inbound_at >= MESSAGING_WINDOW_MS) return; // Meta's 24-hour rule
+  if (text === thread.last_auto_reply) return;                            // never repeat the same message
+
+  try {
+    await sendText(connection, thread, text);
+    db.prepare("UPDATE meta_threads SET last_auto_reply = ? WHERE id = ?").run(text, thread.id);
+    console.log(`Auto reply sent on thread ${thread.id}`);
+  } catch (error) {
+    markNeedsReconnect(error, connection);
+    console.error("Auto reply failed:", error.message);
+  }
 }
 
 const SOURCE_NAME = { facebook: "Facebook", instagram: "Instagram" };
@@ -562,7 +638,11 @@ function decideAutoOrder(result, thread, platform, text) {
   if (items.some(item => item.in_catalog === false)) problems.push("product not in catalog");
   if (items.some(item => !(Number(item.unit_price) > 0))) problems.push("product without a price");
 
-  if (problems.length) return { status: "needs_review", note: problems.join(" · ") };
+  if (problems.length) {
+    // Only ask the customer when the sole problem is information THEY can give.
+    const onlyMissing = problems.every(problem => problem.startsWith("missing:"));
+    return { status: "needs_review", note: problems.join(" · "), ask: onlyMissing ? missing : [] };
+  }
 
   return {
     status: "order_created",
@@ -613,7 +693,7 @@ async function autoProcessThread(threadId) {
     return;
   }
 
-  let { status, note, body } = decideAutoOrder(result, thread, connection.platform, text);
+  let { status, note, body, ask } = decideAutoOrder(result, thread, connection.platform, text);
   let orderId = null;
 
   if (status === "order_created") {
@@ -642,6 +722,10 @@ async function autoProcessThread(threadId) {
 
   emit(uid, { type: "thread_updated", thread_id: thread.id });
   console.log(`Auto order: thread ${thread.id} -> ${status}${orderId ? ` #${orderId}` : ""}${note ? ` (${note})` : ""}`);
+
+  // Answer the customer: a confirmation, or a request for what is missing.
+  if (status === "order_created") await autoReply(connection, thread.id, confirmationText(body, orderId));
+  else if (status === "needs_review" && ask?.length) await autoReply(connection, thread.id, askText(ask));
 }
 
 export function processWebhook(payload) {
@@ -837,19 +921,7 @@ metaRouter.post("/threads/:id/reply", replyLimiter, async (req, res) => {
   }
 
   try {
-    const sent = await graph(`/${connection.page_id}/messages`, {
-      method: "POST",
-      token: decrypt(connection.token_enc),
-      body: {
-        recipient: { id: thread.customer_id },
-        messaging_type: "RESPONSE",
-        message: { text: parsed.data.text }
-      }
-    });
-
-    // Saved with Meta's message id, so the "echo" webhook that follows is recognised as a duplicate.
-    storeMessage(connection, thread.customer_id, sent.message_id, "out", parsed.data.text, Date.now());
-    emit(req.user.id, { type: "message", thread_id: thread.id, direction: "out" });
+    const sent = await sendText(connection, thread, parsed.data.text);
 
     return res.status(201).json({ ok: true, message_id: sent.message_id });
   } catch (error) {
