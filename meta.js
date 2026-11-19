@@ -313,6 +313,8 @@ metaPublicRouter.get("/webhook", (req, res) => {
     && req.query["hub.mode"] === "subscribe"
     && req.query["hub.verify_token"] === verifyToken;
 
+  console.log(`Meta webhook verification request: ${ok ? "OK" : "REJECTED (verify token mismatch)"}`);
+
   if (!ok) return res.sendStatus(403);
   res.status(200).type("text/plain").send(String(req.query["hub.challenge"] || ""));
 });
@@ -328,7 +330,10 @@ export function validSignature(rawBody, header, secret) {
 
 // The signature is computed on the exact bytes Meta sent, so this route reads the RAW body.
 metaPublicRouter.post("/webhook", express.raw({ type: "*/*", limit: "1mb" }), (req, res) => {
-  if (!validSignature(req.body, req.get("x-hub-signature-256"), cfg().appSecret)) {
+  const signatureOk = validSignature(req.body, req.get("x-hub-signature-256"), cfg().appSecret);
+  console.log(`Meta webhook POST received. Signature ${signatureOk ? "valid" : "INVALID"}, ${req.body?.length || 0} bytes`);
+
+  if (!signatureOk) {
     return res.sendStatus(403);
   }
 
@@ -481,12 +486,17 @@ export function processWebhook(payload) {
   const platform = payload?.object === "instagram" ? "instagram" : payload?.object === "page" ? "facebook" : null;
   if (!platform) return;
 
+  console.log(`Meta webhook payload: object=${payload.object}, entries=${(payload.entry || []).map(e => e.id).join(",")}`);
+
   for (const entry of payload.entry || []) {
     const connection = db.prepare(
       "SELECT * FROM meta_connections WHERE platform = ? AND account_id = ? AND status != 'removed'"
     ).get(platform, String(entry.id));
 
-    if (!connection) continue;
+    if (!connection) {
+      console.log(`Meta webhook: no connection found for ${platform} account ${entry.id}`);
+      continue;
+    }
 
     for (const event of entry.messaging || []) {
       // A tap on a button / quick reply arrives as a "postback" (no `message`): treat its title as text.
