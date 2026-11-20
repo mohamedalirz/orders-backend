@@ -251,22 +251,127 @@ function findDuplicate(uid, phone, items) {
   `).get(uid, phone, summary.product, summary.quantity);
 }
 
-// Orders detected automatically from Facebook / Instagram messages (see meta.js).
-// Same validation and same duplicate check as an order created by hand.
-setAutoOrderHandler((uid, body) => {
-  const parsed = createSchema.safeParse(withLegacyItems(body));
+// --------------------------------------------------
+// ORDERS BUILT FROM FACEBOOK / INSTAGRAM CONVERSATIONS (see meta.js)
+//
+// One order per conversation is "open" (draft = 1) until the customer has given everything.
+// Only that order, identified by BOTH its id and the conversation that owns it (meta_thread_id),
+// can be changed. Fields are validated one by one with the same rules as a manual order, and a field that
+// already has a value is never overwritten.
+// --------------------------------------------------
 
-  if (!parsed.success) {
-    return { ok: false, reason: parsed.error.issues.map(issue => issue.message).join("; ") };
-  }
+const pickValid = (schema, value) => {
+  const parsed = schema.safeParse(value == null ? "" : String(value));
+  return parsed.success ? parsed.data : "";
+};
 
-  const items = prepareItems(parsed.data.items);
-  const duplicate = findDuplicate(uid, parsed.data.phone, items);
-
-  if (duplicate) return { ok: false, duplicate_id: duplicate.id };
-
+setAutoOrderHandler((uid, ctx) => {
   try {
-    return { ok: true, order_id: createOrderTransaction(uid, parsed.data, items) };
+    return db.transaction(() => {
+      const tid = ctx.threadId;
+      let row = null;
+      let created = false;
+
+      if (ctx.openOrderId) {
+        row = db.prepare(`
+          SELECT * FROM orders
+          WHERE id = ? AND user_id = ? AND meta_thread_id = ? AND draft = 1 AND status = 'pending'
+        `).get(ctx.openOrderId, uid, tid);
+
+        if (!row) return { ok: false, gone: true };
+      }
+
+      const clean = {
+        customer_name: pickValid(fields.customer_name, ctx.fields.customer_name),
+        phone: pickValid(phoneSchema, ctx.fields.phone),
+        city: pickValid(fields.city, ctx.fields.city),
+        address: pickValid(fields.address, ctx.fields.address)
+      };
+
+      const items = prepareItems(
+        (ctx.items || []).slice(0, 20).map(item => itemSchema.safeParse(item)).filter(r => r.success).map(r => r.data)
+      );
+
+      // ---- first message of an order: save the draft
+      if (!row) {
+        if (!items.length) return { ok: false, reason: "no valid product detected" };
+
+        const id = createOrderTransaction(uid, {
+          ...clean,
+          status: "pending",
+          delivery_status: "not_sent",
+          cod_status: "not_received",
+          source: ctx.source,
+          message: String(ctx.message || "").slice(0, 4000)
+        }, items);
+
+        db.prepare("UPDATE orders SET meta_thread_id = ?, draft = 1 WHERE id = ? AND user_id = ?").run(tid, id, uid);
+
+        row = db.prepare("SELECT * FROM orders WHERE id = ? AND user_id = ?").get(id, uid);
+        created = true;
+      } else {
+        // ---- later messages: fill what is still empty, nothing else
+        const set = { message: String(ctx.message || "").slice(0, 4000) };
+
+        for (const key of ["customer_name", "phone", "city", "address"]) {
+          if (!row[key] && clean[key]) set[key] = clean[key];
+        }
+
+        // keys come from the fixed list above, never from the customer, so this is safe.
+        db.prepare(`
+          UPDATE orders SET ${Object.keys(set).map(k => `${k} = @${k}`).join(", ")}
+          WHERE id = @id AND user_id = @uid AND meta_thread_id = @tid AND draft = 1
+        `).run({ ...set, id: row.id, uid, tid });
+
+        // Items follow the customer only while the seller has not changed them.
+        if (ctx.replaceItems && items.length) {
+          db.prepare(`
+            UPDATE orders SET product = @product, variant = @variant, quantity = @quantity, unit_price = @unit_price
+            WHERE id = @id AND user_id = @uid AND meta_thread_id = @tid AND draft = 1
+          `).run({ ...summarizeItems(items), id: row.id, uid, tid });
+
+          db.prepare("DELETE FROM order_items WHERE order_id = ?").run(row.id);
+          for (const item of items) insertItemStatement.run({ order_id: row.id, ...item });
+        }
+
+        row = db.prepare("SELECT * FROM orders WHERE id = ? AND user_id = ?").get(row.id, uid);
+      }
+
+      // ---- what is still missing, and is the order complete?
+      const name = row.customer_name || ctx.fallbackName || "";
+      const missing = [];
+      if (!name) missing.push("customer_name");
+      if (!row.phone) missing.push("phone");
+      if (!row.city) missing.push("city");
+      if (ctx.requireAddress && !row.address) missing.push("address");
+
+      const orderItems = db.prepare("SELECT unit_price FROM order_items WHERE order_id = ?").all(row.id);
+      const unpriced = !orderItems.length || orderItems.some(item => !(item.unit_price > 0));
+
+      let complete = false;
+      let duplicate_id = null;
+
+      if (!missing.length && ctx.canComplete && !unpriced) {
+        const duplicate = db.prepare(`
+          SELECT id FROM orders
+          WHERE user_id = ? AND id != ? AND phone = ? AND product = ? AND quantity = ?
+            AND status != 'cancelled' AND created_at >= datetime('now', '-15 minutes')
+          ORDER BY id DESC LIMIT 1
+        `).get(uid, row.id, row.phone, row.product, row.quantity);
+
+        if (duplicate) {
+          duplicate_id = duplicate.id; // the draft stays open: the seller decides
+        } else {
+          db.prepare(`
+            UPDATE orders SET draft = 0, customer_name = ?
+            WHERE id = ? AND user_id = ? AND meta_thread_id = ? AND draft = 1
+          `).run(name, row.id, uid, tid);
+          complete = true;
+        }
+      }
+
+      return { ok: true, order_id: row.id, created, complete, missing, unpriced, duplicate_id };
+    })();
   } catch (error) {
     console.error("Auto order save error:", error);
     return { ok: false, reason: "could not save" };
