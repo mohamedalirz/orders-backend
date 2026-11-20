@@ -126,7 +126,8 @@ db.exec("CREATE INDEX IF NOT EXISTS idx_meta_conn_fbuser ON meta_connections(fb_
     ["last_auto_reply", "TEXT NOT NULL DEFAULT ''"],
     ["draft_items", "TEXT NOT NULL DEFAULT ''"],   // what the automation last wrote into the open order's items
     ["last_result", "TEXT NOT NULL DEFAULT ''"],   // the AI's last reading of this conversation (shown without clicking)
-    ["analyzed_upto", "INTEGER NOT NULL DEFAULT 0"] // last customer message already analysed
+    ["analyzed_upto", "INTEGER NOT NULL DEFAULT 0"], // last customer message already analysed
+    ["reply_error", "TEXT NOT NULL DEFAULT ''"]      // why the last automatic reply could not be sent (shown in the app)
   ]) {
     if (!have.includes(name)) db.exec(`ALTER TABLE meta_threads ADD COLUMN ${name} ${definition}`);
   }
@@ -549,7 +550,7 @@ async function sendText(connection, thread, text) {
 //   META_AUTO_DELAY_MS            quiet time before analysing (default 5000)
 //   META_AUTO_MIN_CONFIDENCE      below this a draft is not completed automatically (default 0.6)
 //   META_AUTO_REPLY=0             saves orders but does not answer customers
-//   META_AUTO_REPLY_CHAT=0        does not answer questions (only confirms orders / asks for missing details)
+//   META_AUTO_REPLY_CHAT=0        no answers to greetings / questions (orders are still confirmed and completed)
 //   META_AUTO_REQUIRE_ADDRESS=1   also requires a street address before an order is complete
 // --------------------------------------------------
 
@@ -619,25 +620,57 @@ const itemsSnapshot = orderId => JSON.stringify(
   db.prepare("SELECT product, variant, quantity FROM order_items WHERE order_id = ? ORDER BY id").all(orderId)
 );
 
-// Never lets a failed reply break an order that was already saved.
+// The customer is answered after EVERY message. Nothing the seller still has to check (catalog, price,
+// confidence...) stops the answer. If Meta refuses a message, the order is still saved and the reason is
+// shown on the conversation (reply_error), so it never fails silently.
 async function autoReply(connection, threadId, text) {
   if (process.env.META_AUTO_REPLY === "0") return;
+
+  const fail = message => {
+    db.prepare("UPDATE meta_threads SET reply_error = ? WHERE id = ?").run(String(message).slice(0, 300), threadId);
+    emit(connection.user_id, { type: "thread_updated", thread_id: threadId });
+    console.error(`Auto reply NOT sent on thread ${threadId}: ${message}`);
+  };
 
   const thread = db.prepare("SELECT * FROM meta_threads WHERE id = ?").get(threadId);
   const current = db.prepare("SELECT status FROM meta_connections WHERE id = ?").get(connection.id);
 
-  if (!thread || current?.status !== "active") return;
-  if (Date.now() - thread.last_inbound_at >= MESSAGING_WINDOW_MS) return; // Meta's 24-hour rule
-  if (text === thread.last_auto_reply) return;                            // never repeat the same message
+  if (!thread) return;
+  if (current?.status !== "active") return fail("the connection must be reconnected in Settings");
+  if (Date.now() - thread.last_inbound_at >= MESSAGING_WINDOW_MS) {
+    return fail("more than 24 hours since the customer's last message (Meta rule)");
+  }
 
   try {
     await sendText(connection, thread, text);
-    db.prepare("UPDATE meta_threads SET last_auto_reply = ? WHERE id = ?").run(text, thread.id);
+    db.prepare("UPDATE meta_threads SET last_auto_reply = ?, reply_error = '' WHERE id = ?").run(text, thread.id);
+    emit(connection.user_id, { type: "thread_updated", thread_id: thread.id });
     console.log(`Auto reply sent on thread ${thread.id}`);
   } catch (error) {
     markNeedsReconnect(error, connection);
-    console.error("Auto reply failed:", error.message);
+    fail(`Meta refused the reply: ${error.message}${error.code ? ` (code ${error.code})` : ""}`);
   }
+}
+
+// Messages used when the AI has nothing better to say.
+const FALLBACK = {
+  generic: "شكرا على رسالتك 🙏 باش نرجعولك في أقرب وقت.",
+  welcome: "مرحبا 👋 شنو تحب تطلب؟ ابعثلنا المنتج والكمية، الإسم، نمرة التليفون والولاية باش نسجلو الطلبية.",
+  complaint: "نعتذرو على الإزعاج 🙏 باش نتصلو بيك في أقرب وقت.",
+  afterOrder: "بالسلامة 🙏 كان تحب تزيد حاجة ابعثلنا."
+};
+
+const receivedText = orderId =>
+  `✅ استلمنا طلبيتك (#${pad(orderId)})\nباش نتصلو بيك قريب للتأكيد. شكرا برشا 🙏`;
+
+// The answer to a message that is not an order (greeting, question, thanks, complaint).
+function chatAnswer(result, intent, finished) {
+  const own = result.provider !== "rules" && (intent === "question" || intent === "other") && result.suggested_reply;
+  if (own) return own;
+  if (finished) return FALLBACK.afterOrder;
+  if (intent === "question") return FALLBACK.generic;
+  if (intent === "complaint") return FALLBACK.complaint;
+  return FALLBACK.welcome;
 }
 
 // Reasons the SELLER has to look at an order (the customer is not bothered with these).
@@ -701,10 +734,7 @@ async function autoProcessThread(threadId) {
     items: items.map(item => ({ product: item.product, quantity: item.quantity || 1, variant: item.variant || "" }))
   });
 
-  const chatReply = result.suggested_reply
-    && (intent === "question" || intent === "other")
-    && result.provider !== "rules"
-    && process.env.META_AUTO_REPLY_CHAT !== "0";
+  const chatOn = process.env.META_AUTO_REPLY_CHAT !== "0";
 
   // ---------- Not an order (and no draft waiting): chat or a question ----------
   if (!isOpen && (!items.length || intent === "question" || intent === "complaint")) {
@@ -722,7 +752,7 @@ async function autoProcessThread(threadId) {
     emit(uid, { type: "thread_updated", thread_id: thread.id });
     console.log(`Auto order: thread ${thread.id} -> not an order`);
 
-    if (chatReply) await autoReply(connection, thread.id, result.suggested_reply);
+    if (chatOn) await autoReply(connection, thread.id, chatAnswer(result, intent, finished));
     return;
   }
 
@@ -773,6 +803,7 @@ async function autoProcessThread(threadId) {
       .run(out.reason || "could not save", lastId, summary, thread.id);
     emit(uid, { type: "thread_updated", thread_id: thread.id });
     console.log(`Auto order: thread ${thread.id} -> needs_review (${out.reason})`);
+    if (chatOn) await autoReply(connection, thread.id, FALLBACK.generic);
     return;
   }
 
@@ -815,12 +846,17 @@ async function autoProcessThread(threadId) {
   emit(uid, { type: "thread_updated", thread_id: thread.id });
   console.log(`Auto order: thread ${thread.id} -> ${status} #${orderId}${out.created ? " (new)" : ""}${note ? ` (${note})` : ""}`);
 
-  // ---------- Answer the customer ----------
+  // ---------- Answer the customer, every time ----------
+  //   complete order            -> confirmation with the total
+  //   something still missing   -> ask for it (even if the seller also has something to check)
+  //   complete but to be checked (catalog, price, duplicate, AI doubt) -> "received, we will call you"
   if (out.complete) {
     await autoReply(connection, thread.id, confirmationText(orderId));
-  } else if (!issues.length && missing.length) {
-    const answer = intent === "question" && chatReply ? result.suggested_reply : askText(missing);
-    await autoReply(connection, thread.id, answer);
+  } else if (missing.length) {
+    const ask = askText(missing);
+    await autoReply(connection, thread.id, intent === "question" && chatOn ? `${chatAnswer(result, intent, false)}\n\n${ask}` : ask);
+  } else {
+    await autoReply(connection, thread.id, receivedText(orderId));
   }
 }
 
@@ -948,7 +984,7 @@ metaRouter.get("/threads", (req, res) => {
   const rows = db.prepare(`
     SELECT t.id, t.connection_id, c.platform, c.name AS account_name, t.customer_id, t.customer_name,
            t.last_message, t.last_message_at, t.last_inbound_at, t.unread,
-           t.auto_status, t.auto_note, t.order_id, t.last_result
+           t.auto_status, t.auto_note, t.order_id, t.last_result, t.reply_error
     FROM meta_threads t JOIN meta_connections c ON c.id = t.connection_id
     WHERE t.user_id = ? ${connectionId ? "AND t.connection_id = ?" : ""}
     ORDER BY t.last_message_at DESC LIMIT ?
