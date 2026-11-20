@@ -699,6 +699,36 @@ function aiBlockers(result, isNewDraft) {
   return blockers;
 }
 
+// The AI reads the whole conversation, so "hoodie M x2" followed by "taille L" can come back as two lines
+// of the same product. A later size / color for a product the customer already ordered is a CHANGE, not a
+// second item: keep ONE line per product + color, with the latest size and the biggest quantity.
+function mergeSameProduct(items) {
+  const merged = [];
+
+  for (const item of items) {
+    const key = String(item.product).trim().toLowerCase();
+    const color = String(item.color || "").trim().toLowerCase();
+    const size = String(item.size || "").trim();
+
+    const same = merged.find(m =>
+      m._key === key && (!m._color || !color || m._color === color)
+    );
+
+    if (!same) {
+      merged.push({ ...item, _key: key, _color: color });
+      continue;
+    }
+
+    same.quantity = Math.max(Number(same.quantity) || 1, Number(item.quantity) || 1);
+    if (size) same.size = size;
+    if (item.color) { same.color = item.color; same._color = color; }
+    if (item.unit_price) same.unit_price = item.unit_price;
+    same.variant = [same.color, same.size].filter(Boolean).join(" / ") || item.variant || same.variant || "";
+  }
+
+  return merged.map(({ _key, _color, ...rest }) => rest);
+}
+
 async function autoProcessThread(threadId) {
   const thread = db.prepare("SELECT * FROM meta_threads WHERE id = ?").get(threadId);
   if (!thread) return;
@@ -727,7 +757,7 @@ async function autoProcessThread(threadId) {
     return;
   }
 
-  const items = (result.items || []).filter(item => item.product);
+  const items = mergeSameProduct((result.items || []).filter(item => item.product));
   const intent = result.customer_intent;
   const extracted = result.extracted || {};
 
