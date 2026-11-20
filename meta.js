@@ -551,7 +551,9 @@ async function sendText(connection, thread, text) {
 //   META_AUTO_MIN_CONFIDENCE      below this a draft is not completed automatically (default 0.6)
 //   META_AUTO_REPLY=0             saves orders but does not answer customers
 //   META_AUTO_REPLY_CHAT=0        no answers to greetings / questions (orders are still confirmed and completed)
-//   META_AUTO_REQUIRE_ADDRESS=1   also requires a street address before an order is complete
+//   META_AUTO_REQUIRE_ADDRESS=0   do not require the street address (required by default)
+//   META_AUTO_REQUIRE_VARIANT=0   never ask for color / size (by default they are asked ONLY for products
+//                                 that have colors / sizes in the catalog)
 // --------------------------------------------------
 
 let autoOrderHandler = null;
@@ -594,13 +596,23 @@ const ASK_LABELS = {
   phone: "نمرة التليفون",
   city: "الولاية / المدينة",
   address: "العنوان",
-  product: "المنتج"
+  product: "المنتج",
+  variant: "المقاس / اللون"
 };
 
 const FIELD_NAME = { customer_name: "name", phone: "phone", city: "city", address: "address" };
+const KIND_LABEL = { color: "اللون", size: "المقاس" };
 
-const askText = fields =>
-  `مرحبا 👋 باش نكمل الطلبية متاعك نحتاج:\n${fields.map(f => `- ${ASK_LABELS[f] || f}`).join("\n")}\nبرشا شكرا!`;
+// variantAsks: the colors / sizes still to choose, per product, with the available choices.
+const askText = (fields, variantAsks = []) => {
+  const lines = fields.filter(f => f !== "variant").map(f => `- ${ASK_LABELS[f] || f}`);
+
+  for (const ask of variantAsks) {
+    lines.push(`- ${KIND_LABEL[ask.kind]} (${ask.product})${ask.options.length ? `: ${ask.options.join("، ")}` : ""}`);
+  }
+
+  return `مرحبا 👋 باش نكمل الطلبية متاعك نحتاج:\n${lines.join("\n")}\nبرشا شكرا!`;
+};
 
 function confirmationText(orderId) {
   const items = db.prepare(
@@ -760,8 +772,8 @@ async function autoProcessThread(threadId) {
   const openOrderId = isOpen ? thread.order_id : null;
   const blockers = aiBlockers(result, !openOrderId);
 
-  // A Facebook / Instagram profile name stands in for a name the customer never gave (an @handle is not a name).
-  const fallbackName = thread.customer_name && !thread.customer_name.startsWith("@") ? thread.customer_name : "";
+  // Everything is required from the customer: a Facebook / Instagram profile name does not replace their name.
+  const fallbackName = "";
 
   const out = autoOrderHandler(uid, {
     threadId: thread.id,
@@ -785,7 +797,8 @@ async function autoProcessThread(threadId) {
     replaceItems: Boolean(openOrderId) && itemsSnapshot(openOrderId) === thread.draft_items,
     fallbackName,
     canComplete: blockers.length === 0,
-    requireAddress: process.env.META_AUTO_REQUIRE_ADDRESS === "1"
+    requireAddress: process.env.META_AUTO_REQUIRE_ADDRESS !== "0",
+    requireVariant: process.env.META_AUTO_REQUIRE_VARIANT !== "0"
   });
 
   // The draft was deleted, or the seller confirmed / cancelled it: it is closed. What the customer
@@ -814,7 +827,11 @@ async function autoProcessThread(threadId) {
   if (out.unpriced) issues.push("product not in catalog or without a price");
   if (out.duplicate_id) issues.push(`possible duplicate of order #${pad(out.duplicate_id)}`);
 
-  const waiting = missing.length ? `waiting for: ${missing.map(f => FIELD_NAME[f] || f).join(", ")}` : "";
+  const waitingFor = [
+    ...missing.filter(f => f !== "variant").map(f => FIELD_NAME[f] || f),
+    ...(out.variantAsks || []).map(ask => `${ask.kind} of ${ask.product}`)
+  ];
+  const waiting = waitingFor.length ? `waiting for: ${waitingFor.join(", ")}` : "";
 
   let status;
   let note;
@@ -853,7 +870,7 @@ async function autoProcessThread(threadId) {
   if (out.complete) {
     await autoReply(connection, thread.id, confirmationText(orderId));
   } else if (missing.length) {
-    const ask = askText(missing);
+    const ask = askText(missing, out.variantAsks);
     await autoReply(connection, thread.id, intent === "question" && chatOn ? `${chatAnswer(result, intent, false)}\n\n${ask}` : ask);
   } else {
     await autoReply(connection, thread.id, receivedText(orderId));
