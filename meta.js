@@ -123,10 +123,23 @@ db.exec("CREATE INDEX IF NOT EXISTS idx_meta_conn_fbuser ON meta_connections(fb_
     ["auto_note", "TEXT NOT NULL DEFAULT ''"],
     ["order_id", "INTEGER"],
     ["order_cutoff", "INTEGER NOT NULL DEFAULT 0"],
-    ["last_auto_reply", "TEXT NOT NULL DEFAULT ''"]
+    ["last_auto_reply", "TEXT NOT NULL DEFAULT ''"],
+    ["draft_items", "TEXT NOT NULL DEFAULT ''"],   // what the automation last wrote into the open order's items
+    ["last_result", "TEXT NOT NULL DEFAULT ''"],   // the AI's last reading of this conversation (shown without clicking)
+    ["analyzed_upto", "INTEGER NOT NULL DEFAULT 0"] // last customer message already analysed
   ]) {
     if (!have.includes(name)) db.exec(`ALTER TABLE meta_threads ADD COLUMN ${name} ${definition}`);
   }
+}
+
+// An order built from a conversation remembers WHICH conversation it belongs to, and whether it is still
+// a draft waiting for the customer. The automation only ever edits orders with draft = 1 that carry
+// the id of the conversation it is working on.
+{
+  const have = db.prepare("PRAGMA table_info(orders)").all().map(c => c.name);
+  if (!have.includes("meta_thread_id")) db.exec("ALTER TABLE orders ADD COLUMN meta_thread_id INTEGER");
+  if (!have.includes("draft")) db.exec("ALTER TABLE orders ADD COLUMN draft INTEGER NOT NULL DEFAULT 0");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_orders_meta_thread ON orders(meta_thread_id)");
 }
 
 db.prepare("DELETE FROM meta_oauth_states WHERE expires_at < ?").run(Date.now());
@@ -518,31 +531,40 @@ async function sendText(connection, thread, text) {
 }
 
 // --------------------------------------------------
-// AUTOMATIC ORDER DETECTION
-// When a customer writes, wait until they stop typing, run the same AI extraction as the AI Inbox,
-// and save the order if everything the server requires is there. Otherwise mark the conversation
-// "needs review" so the seller finishes it. server.js supplies the real order saver
-// (same validation, same duplicate check as a manual order) through setAutoOrderHandler.
+// AUTOMATIC ORDERS
+// Every customer message is analysed with the same AI extraction as the AI Inbox (after a short quiet time,
+// so a burst of messages counts once) and the customer is answered.
 //
-//   META_AUTO_ORDERS=0            turns this off
-//   META_AUTO_DELAY_MS            quiet time before analysing (default 15000)
-//   META_AUTO_MIN_CONFIDENCE      below this the order goes to review (default 0.6)
-//   META_AUTO_REPLY=0             saves orders but does not answer customers (default: answers)
-//   META_AUTO_REQUIRE_ADDRESS=1   also require a street address (default: city + phone + name are enough)
+//   * An order is saved as soon as a product is detected, even if the customer has not given everything yet
+//     (a DRAFT). The customer is asked for what is missing.
+//   * When the customer sends more, the SAME draft is completed. It is found through the conversation that
+//     owns it (orders.meta_thread_id + orders.draft = 1), never by guessing, so no other order can be touched.
+//   * Existing values are never overwritten: only empty fields are filled (so a correction made by the seller
+//     is kept). Items are replaced only while they are still exactly what the automation wrote.
+//   * A complete draft becomes a normal order; the next order request starts a new order.
+//
+// server.js supplies the database side (same validation as manual orders) through setAutoOrderHandler.
+//
+//   META_AUTO_ORDERS=0            turns all of this off
+//   META_AUTO_DELAY_MS            quiet time before analysing (default 5000)
+//   META_AUTO_MIN_CONFIDENCE      below this a draft is not completed automatically (default 0.6)
+//   META_AUTO_REPLY=0             saves orders but does not answer customers
+//   META_AUTO_REPLY_CHAT=0        does not answer questions (only confirms orders / asks for missing details)
+//   META_AUTO_REQUIRE_ADDRESS=1   also requires a street address before an order is complete
 // --------------------------------------------------
 
 let autoOrderHandler = null;
 export const setAutoOrderHandler = fn => { autoOrderHandler = fn; };
 
-const autoTimers = new Map(); // thread id -> timer
-const autoRunning = new Set(); // conversations being analysed right now
+const autoTimers = new Map();   // thread id -> timer
+const autoRunning = new Set();  // conversations being analysed right now
 
 function scheduleAutoOrder(threadId) {
   if (!autoOrderHandler || process.env.META_AUTO_ORDERS === "0") return;
 
   clearTimeout(autoTimers.get(threadId));
 
-  const delay = Number(process.env.META_AUTO_DELAY_MS ?? 15_000);
+  const delay = Number(process.env.META_AUTO_DELAY_MS ?? 5_000);
 
   const run = () => {
     autoTimers.delete(threadId);
@@ -562,6 +584,9 @@ function scheduleAutoOrder(threadId) {
   autoTimers.set(threadId, setTimeout(run, delay));
 }
 
+const SOURCE_NAME = { facebook: "Facebook", instagram: "Instagram" };
+const pad = id => String(id).padStart(4, "0");
+
 // Customer-facing messages (Tunisian Derja, like the AI's own suggested replies).
 const ASK_LABELS = {
   customer_name: "الإسم",
@@ -571,19 +596,30 @@ const ASK_LABELS = {
   product: "المنتج"
 };
 
+const FIELD_NAME = { customer_name: "name", phone: "phone", city: "city", address: "address" };
+
 const askText = fields =>
   `مرحبا 👋 باش نكمل الطلبية متاعك نحتاج:\n${fields.map(f => `- ${ASK_LABELS[f] || f}`).join("\n")}\nبرشا شكرا!`;
 
-function confirmationText(body, orderId) {
-  const lines = body.items
+function confirmationText(orderId) {
+  const items = db.prepare(
+    "SELECT product, variant, quantity, unit_price FROM order_items WHERE order_id = ? ORDER BY id"
+  ).all(orderId);
+
+  const lines = items
     .map(item => `- ${item.product}${item.variant ? ` (${item.variant})` : ""} × ${item.quantity}`)
     .join("\n");
-  const total = Number(body.items.reduce((sum, item) => sum + item.quantity * item.unit_price, 0).toFixed(3));
+  const total = Number(items.reduce((sum, item) => sum + item.quantity * item.unit_price, 0).toFixed(3));
 
-  return `✅ طلبيتك تسجّلت (#${String(orderId).padStart(4, "0")})\n${lines}\nالمجموع: ${total} د.ت\nباش نعيطولك قريب للتأكيد. شكرا برشا 🙏`;
+  return `✅ طلبيتك تسجّلت (#${pad(orderId)})\n${lines}\nالمجموع: ${total} د.ت\nباش نعيطولك قريب للتأكيد. شكرا برشا 🙏`;
 }
 
-// Never lets a failed reply break the order that was already saved.
+// What the automation last wrote into an order's items: if they still match, the seller has not changed them.
+const itemsSnapshot = orderId => JSON.stringify(
+  db.prepare("SELECT product, variant, quantity FROM order_items WHERE order_id = ? ORDER BY id").all(orderId)
+);
+
+// Never lets a failed reply break an order that was already saved.
 async function autoReply(connection, threadId, text) {
   if (process.env.META_AUTO_REPLY === "0") return;
 
@@ -604,66 +640,18 @@ async function autoReply(connection, threadId, text) {
   }
 }
 
-const SOURCE_NAME = { facebook: "Facebook", instagram: "Instagram" };
+// Reasons the SELLER has to look at an order (the customer is not bothered with these).
+function aiBlockers(result, isNewDraft) {
+  const blockers = [];
 
-// Returns { status, note, body? } : body is ready to be saved as an order.
-function decideAutoOrder(result, thread, platform, text) {
-  const items = (result.items || []).filter(item => item.product);
-  const intent = result.customer_intent;
-
-  // No product, or the customer is only asking a question / complaining: not an order.
-  if (!items.length || intent === "question" || intent === "complaint") return { status: "not_order", note: "" };
-
-  const extracted = result.extracted || {};
-  const name = extracted.customer_name || thread.customer_name || "";
-  const problems = [];
-
-  if (intent !== "new_order") problems.push("unclear whether this is an order");
-
-  if (result.provider === "rules") problems.push("AI offline: verify manually");
+  if (result.provider === "rules") blockers.push("AI offline: verify manually");
 
   const minConfidence = Number(process.env.META_AUTO_MIN_CONFIDENCE ?? 0.6);
-  if (result.confidence != null && result.confidence < minConfidence) problems.push("low confidence");
+  if (result.confidence != null && result.confidence < minConfidence) blockers.push("low confidence");
 
-  // The Facebook / Instagram profile name replaces a name the AI could not find.
-  // The address is optional for an order (like the order form), unless META_AUTO_REQUIRE_ADDRESS=1.
-  const requireAddress = process.env.META_AUTO_REQUIRE_ADDRESS === "1";
+  if (isNewDraft && result.customer_intent !== "new_order") blockers.push("unclear whether this is an order");
 
-  const missing = (result.missing || []).filter(field =>
-    !(name && /name/i.test(String(field))) && (requireAddress || field !== "address")
-  );
-  if (requireAddress && !extracted.address && !missing.includes("address")) missing.push("address");
-  if (missing.length) problems.push(`missing: ${missing.join(", ")}`);
-
-  if (items.some(item => item.in_catalog === false)) problems.push("product not in catalog");
-  if (items.some(item => !(Number(item.unit_price) > 0))) problems.push("product without a price");
-
-  if (problems.length) {
-    // Only ask the customer when the sole problem is information THEY can give.
-    const onlyMissing = problems.every(problem => problem.startsWith("missing:"));
-    return { status: "needs_review", note: problems.join(" · "), ask: onlyMissing ? missing : [] };
-  }
-
-  return {
-    status: "order_created",
-    note: "",
-    body: {
-      customer_name: name,
-      phone: extracted.phone || "",
-      city: extracted.city || "",
-      address: extracted.address || "",
-      items: items.map(item => ({
-        product: item.product,
-        variant: item.variant || "",
-        color: item.color || "",
-        size: item.size || "",
-        quantity: item.quantity || 1,
-        unit_price: item.unit_price || 0
-      })),
-      source: SOURCE_NAME[platform] || "manual",
-      message: text.slice(0, 4000)
-    }
-  };
+  return blockers;
 }
 
 async function autoProcessThread(threadId) {
@@ -673,7 +661,7 @@ async function autoProcessThread(threadId) {
   const connection = db.prepare("SELECT * FROM meta_connections WHERE id = ?").get(thread.connection_id);
   if (!connection) return;
 
-  // Only customer messages that are not already part of a saved order.
+  // Only customer messages that are not already part of a finished order.
   const rows = db.prepare(
     "SELECT id, text FROM meta_messages WHERE thread_id = ? AND direction = 'in' AND id > ? ORDER BY id DESC LIMIT 10"
   ).all(thread.id, thread.order_cutoff || 0).reverse();
@@ -681,6 +669,7 @@ async function autoProcessThread(threadId) {
   if (!rows.length) return;
 
   const text = rows.map(row => row.text).join("\n").slice(-2000);
+  const lastId = rows[rows.length - 1].id;
   const uid = connection.user_id;
 
   const products = db.prepare("SELECT id, name, price, aliases FROM products WHERE user_id = ? ORDER BY name").all(uid);
@@ -693,39 +682,146 @@ async function autoProcessThread(threadId) {
     return;
   }
 
-  let { status, note, body, ask } = decideAutoOrder(result, thread, connection.platform, text);
-  let orderId = null;
+  const items = (result.items || []).filter(item => item.product);
+  const intent = result.customer_intent;
+  const extracted = result.extracted || {};
 
-  if (status === "order_created") {
-    const saved = autoOrderHandler(uid, body);
+  // This conversation has an open draft only if it says so AND the order is still a pending draft (checked again by the database).
+  const isOpen = Boolean(thread.order_id) && (thread.auto_status === "draft" || thread.auto_status === "needs_review");
 
-    if (saved.ok) {
-      orderId = saved.order_id;
-    } else {
-      status = "needs_review";
-      note = saved.duplicate_id
-        ? `possible duplicate of order #${String(saved.duplicate_id).padStart(4, "0")}`
-        : saved.reason || "could not save";
-    }
+  const summary = JSON.stringify({
+    intent,
+    confidence: result.confidence ?? null,
+    extracted: {
+      customer_name: extracted.customer_name || "",
+      phone: extracted.phone || "",
+      city: extracted.city || "",
+      address: extracted.address || ""
+    },
+    items: items.map(item => ({ product: item.product, quantity: item.quantity || 1, variant: item.variant || "" }))
+  });
+
+  const chatReply = result.suggested_reply
+    && (intent === "question" || intent === "other")
+    && result.provider !== "rules"
+    && process.env.META_AUTO_REPLY_CHAT !== "0";
+
+  // ---------- Not an order (and no draft waiting): chat or a question ----------
+  if (!isOpen && (!items.length || intent === "question" || intent === "complaint")) {
+    const finished = thread.auto_status === "order_created"; // keep the badge of the order just saved
+
+    db.prepare("UPDATE meta_threads SET auto_status = ?, auto_note = ?, analyzed_upto = ?, last_result = ? WHERE id = ?")
+      .run(
+        finished ? thread.auto_status : "not_order",
+        finished ? thread.auto_note : "",
+        lastId,
+        finished ? thread.last_result : summary,
+        thread.id
+      );
+
+    emit(uid, { type: "thread_updated", thread_id: thread.id });
+    console.log(`Auto order: thread ${thread.id} -> not an order`);
+
+    if (chatReply) await autoReply(connection, thread.id, result.suggested_reply);
+    return;
   }
 
-  // A thank-you after a saved order is not a new "not an order": keep the order badge.
-  if (status === "not_order" && thread.auto_status === "order_created") return;
+  // ---------- Order: create the draft, or complete the one this conversation owns ----------
+  const openOrderId = isOpen ? thread.order_id : null;
+  const blockers = aiBlockers(result, !openOrderId);
 
-  if (status === "order_created") {
-    db.prepare("UPDATE meta_threads SET auto_status = ?, auto_note = '', order_id = ?, order_cutoff = ? WHERE id = ?")
-      .run(status, orderId, rows[rows.length - 1].id, thread.id);
-    emit(uid, { type: "order_created", thread_id: thread.id, order_id: orderId });
+  // A Facebook / Instagram profile name stands in for a name the customer never gave (an @handle is not a name).
+  const fallbackName = thread.customer_name && !thread.customer_name.startsWith("@") ? thread.customer_name : "";
+
+  const out = autoOrderHandler(uid, {
+    threadId: thread.id,
+    openOrderId,
+    fields: {
+      customer_name: extracted.customer_name,
+      phone: extracted.phone,
+      city: extracted.city,
+      address: extracted.address
+    },
+    items: items.map(item => ({
+      product: item.product,
+      variant: item.variant || "",
+      color: item.color || "",
+      size: item.size || "",
+      quantity: item.quantity || 1,
+      unit_price: item.unit_price || 0
+    })),
+    message: text,
+    source: SOURCE_NAME[connection.platform] || "manual",
+    replaceItems: Boolean(openOrderId) && itemsSnapshot(openOrderId) === thread.draft_items,
+    fallbackName,
+    canComplete: blockers.length === 0,
+    requireAddress: process.env.META_AUTO_REQUIRE_ADDRESS === "1"
+  });
+
+  // The draft was deleted, or the seller confirmed / cancelled it: it is closed. What the customer
+  // writes from now on starts from the first message that was not analysed yet (never from the old text).
+  if (!out.ok && out.gone) {
+    db.prepare(
+      "UPDATE meta_threads SET order_id = NULL, auto_status = '', auto_note = '', draft_items = '', order_cutoff = ? WHERE id = ?"
+    ).run(thread.analyzed_upto || 0, thread.id);
+
+    return autoProcessThread(threadId);
+  }
+
+  if (!out.ok) {
+    db.prepare("UPDATE meta_threads SET auto_status = 'needs_review', auto_note = ?, analyzed_upto = ?, last_result = ? WHERE id = ?")
+      .run(out.reason || "could not save", lastId, summary, thread.id);
+    emit(uid, { type: "thread_updated", thread_id: thread.id });
+    console.log(`Auto order: thread ${thread.id} -> needs_review (${out.reason})`);
+    return;
+  }
+
+  const orderId = out.order_id;
+  const missing = out.missing;
+
+  const issues = [...blockers];
+  if (out.unpriced) issues.push("product not in catalog or without a price");
+  if (out.duplicate_id) issues.push(`possible duplicate of order #${pad(out.duplicate_id)}`);
+
+  const waiting = missing.length ? `waiting for: ${missing.map(f => FIELD_NAME[f] || f).join(", ")}` : "";
+
+  let status;
+  let note;
+
+  if (out.complete) {
+    status = "order_created";
+    note = "";
+  } else if (issues.length) {
+    status = "needs_review";
+    note = [...issues, waiting].filter(Boolean).join(" · ");
   } else {
-    db.prepare("UPDATE meta_threads SET auto_status = ?, auto_note = ? WHERE id = ?").run(status, note, thread.id);
+    status = "draft";
+    note = waiting;
   }
 
-  emit(uid, { type: "thread_updated", thread_id: thread.id });
-  console.log(`Auto order: thread ${thread.id} -> ${status}${orderId ? ` #${orderId}` : ""}${note ? ` (${note})` : ""}`);
+  db.prepare(`
+    UPDATE meta_threads
+    SET auto_status = ?, auto_note = ?, order_id = ?, analyzed_upto = ?, last_result = ?,
+        order_cutoff = ?, draft_items = ?
+    WHERE id = ?
+  `).run(
+    status, note, orderId, lastId, summary,
+    out.complete ? lastId : thread.order_cutoff,   // a finished order closes: the next one starts after it
+    out.complete ? "" : itemsSnapshot(orderId),
+    thread.id
+  );
 
-  // Answer the customer: a confirmation, or a request for what is missing.
-  if (status === "order_created") await autoReply(connection, thread.id, confirmationText(body, orderId));
-  else if (status === "needs_review" && ask?.length) await autoReply(connection, thread.id, askText(ask));
+  emit(uid, { type: out.created ? "order_created" : "order_updated", thread_id: thread.id, order_id: orderId });
+  emit(uid, { type: "thread_updated", thread_id: thread.id });
+  console.log(`Auto order: thread ${thread.id} -> ${status} #${orderId}${out.created ? " (new)" : ""}${note ? ` (${note})` : ""}`);
+
+  // ---------- Answer the customer ----------
+  if (out.complete) {
+    await autoReply(connection, thread.id, confirmationText(orderId));
+  } else if (!issues.length && missing.length) {
+    const answer = intent === "question" && chatReply ? result.suggested_reply : askText(missing);
+    await autoReply(connection, thread.id, answer);
+  }
 }
 
 export function processWebhook(payload) {
@@ -852,7 +948,7 @@ metaRouter.get("/threads", (req, res) => {
   const rows = db.prepare(`
     SELECT t.id, t.connection_id, c.platform, c.name AS account_name, t.customer_id, t.customer_name,
            t.last_message, t.last_message_at, t.last_inbound_at, t.unread,
-           t.auto_status, t.auto_note, t.order_id
+           t.auto_status, t.auto_note, t.order_id, t.last_result
     FROM meta_threads t JOIN meta_connections c ON c.id = t.connection_id
     WHERE t.user_id = ? ${connectionId ? "AND t.connection_id = ?" : ""}
     ORDER BY t.last_message_at DESC LIMIT ?
