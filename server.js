@@ -120,8 +120,18 @@ const patchSchema = z.object(
 const productSchema = z.object({
   name: z.string().trim().min(1, "Product name is required").max(80),
   price: z.coerce.number().min(0, "Price cannot be negative").max(100000),
-  aliases: z.string().trim().max(300).optional().default("")
+  aliases: z.string().trim().max(300).optional().default(""),
+  // Options the customer must choose from, e.g. "noir, blanc" / "S, M, L". Empty = the product has none.
+  // Left out of a request = unchanged (older screens that do not send them keep working).
+  colors: z.string().trim().max(200).optional(),
+  sizes: z.string().trim().max(200).optional()
 });
+
+for (const column of ["colors", "sizes"]) {
+  if (!db.prepare("PRAGMA table_info(products)").all().some(c => c.name === column)) {
+    db.exec(`ALTER TABLE products ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
+  }
+}
 
 // Older clients may send one product as flat fields.
 function withLegacyItems(body) {
@@ -260,6 +270,67 @@ function findDuplicate(uid, phone, items) {
 // already has a value is never overwritten.
 // --------------------------------------------------
 
+// What an order still needs from the customer. Used by the automation AND by the "Confirm" check,
+// so both always agree. Address and size/color are required unless switched off with
+// META_AUTO_REQUIRE_ADDRESS=0 / META_AUTO_REQUIRE_VARIANT=0.
+const autoRequirements = () => ({
+  requireAddress: process.env.META_AUTO_REQUIRE_ADDRESS !== "0",
+  requireVariant: process.env.META_AUTO_REQUIRE_VARIANT !== "0"
+});
+
+const MISSING_NAMES = { customer_name: "name", phone: "phone", city: "city", address: "address" };
+
+const splitOptions = value => String(value || "").split(/[,;\n،|]+/).map(option => option.trim()).filter(Boolean);
+
+// Color / size are only asked for products that HAVE colors / sizes in the catalog (Products page).
+// Each ask carries the available choices so the reply can list them.
+function orderMissing(uid, row, orderItems, { requireAddress = true, requireVariant = true, fallbackName = "" } = {}) {
+  const missing = [];
+
+  if (!(row.customer_name || fallbackName)) missing.push("customer_name");
+  if (!row.phone) missing.push("phone");
+  if (!row.city) missing.push("city");
+  if (requireAddress && !row.address) missing.push("address");
+
+  const variantAsks = [];
+  const seen = new Set();
+
+  if (requireVariant) {
+    for (const item of orderItems) {
+      const catalog = db.prepare("SELECT colors, sizes FROM products WHERE user_id = ? AND name = ? COLLATE NOCASE")
+        .get(uid, item.product);
+
+      const colors = splitOptions(catalog?.colors);
+      const sizes = splitOptions(catalog?.sizes);
+
+      if (!colors.length && !sizes.length) continue; // this product needs nothing
+
+      // A variant like "noir / M" written as one text counts as color + size.
+      const parts = String(item.variant || "").split("/").map(part => part.trim()).filter(Boolean);
+      let color = item.color || "";
+      let size = item.size || "";
+
+      if (!color && !size && parts.length) {
+        if (colors.length && sizes.length) { color = parts[0]; size = parts[1] || ""; }
+        else if (colors.length) color = parts[0];
+        else size = parts[0];
+      }
+
+      for (const [kind, options, value] of [["color", colors, color], ["size", sizes, size]]) {
+        const key = `${item.product}|${kind}`;
+        if (options.length && !value && !seen.has(key)) {
+          seen.add(key);
+          variantAsks.push({ product: item.product, kind, options });
+        }
+      }
+    }
+  }
+
+  if (variantAsks.length) missing.push("variant");
+
+  return { missing, variantAsks };
+}
+
 const pickValid = (schema, value) => {
   const parsed = schema.safeParse(value == null ? "" : String(value));
   return parsed.success ? parsed.data : "";
@@ -339,13 +410,17 @@ setAutoOrderHandler((uid, ctx) => {
 
       // ---- what is still missing, and is the order complete?
       const name = row.customer_name || ctx.fallbackName || "";
-      const missing = [];
-      if (!name) missing.push("customer_name");
-      if (!row.phone) missing.push("phone");
-      if (!row.city) missing.push("city");
-      if (ctx.requireAddress && !row.address) missing.push("address");
 
-      const orderItems = db.prepare("SELECT unit_price FROM order_items WHERE order_id = ?").all(row.id);
+      const orderItems = db.prepare(
+        "SELECT product, variant, color, size, unit_price FROM order_items WHERE order_id = ?"
+      ).all(row.id);
+
+      const { missing, variantAsks } = orderMissing(uid, row, orderItems, {
+        requireAddress: ctx.requireAddress,
+        requireVariant: ctx.requireVariant,
+        fallbackName: ctx.fallbackName
+      });
+
       const unpriced = !orderItems.length || orderItems.some(item => !(item.unit_price > 0));
 
       let complete = false;
@@ -370,7 +445,7 @@ setAutoOrderHandler((uid, ctx) => {
         }
       }
 
-      return { ok: true, order_id: row.id, created, complete, missing, unpriced, duplicate_id };
+      return { ok: true, order_id: row.id, created, complete, missing, variantAsks, unpriced, duplicate_id };
     })();
   } catch (error) {
     console.error("Auto order save error:", error);
@@ -469,6 +544,30 @@ app.patch("/api/orders/:id", (req, res) => {
 
   const items = rawItems ? prepareItems(rawItems) : null;
 
+  // An order still waiting for the customer cannot be confirmed (or sent) until it is complete.
+  const current = db.prepare("SELECT * FROM orders WHERE id = ? AND user_id = ?").get(id, uid);
+
+  if (current.draft === 1 && data.status && data.status !== "pending" && data.status !== "cancelled") {
+    const shown = { ...current };
+    for (const key of ["customer_name", "phone", "city", "address"]) if (data[key] !== undefined) shown[key] = data[key];
+
+    const rows = items || db.prepare("SELECT product, variant, color, size FROM order_items WHERE order_id = ?").all(id);
+    const { missing, variantAsks } = orderMissing(uid, shown, rows, autoRequirements());
+
+    if (missing.length) {
+      const waiting = [
+        ...missing.filter(f => f !== "variant").map(f => MISSING_NAMES[f]),
+        ...variantAsks.map(ask => `${ask.kind} of ${ask.product}`)
+      ];
+
+      return res.status(409).json({
+        error: `This order is incomplete: still waiting for the customer (${waiting.join(", ")}).`
+      });
+    }
+
+    data.draft = 0; // complete: the automation stops touching it
+  }
+
   try {
     db.transaction(() => {
       if (items) {
@@ -519,7 +618,7 @@ const isUniqueError = error => String(error.code).startsWith("SQLITE_CONSTRAINT"
 
 app.get("/api/products", (req, res) => {
   res.json(
-    db.prepare("SELECT id, name, price, aliases, created_at FROM products WHERE user_id = ? ORDER BY name COLLATE NOCASE")
+    db.prepare("SELECT id, name, price, aliases, colors, sizes, created_at FROM products WHERE user_id = ? ORDER BY name COLLATE NOCASE")
       .all(req.user.id)
   );
 });
@@ -531,11 +630,11 @@ app.post("/api/products", (req, res) => {
   if (!parsed.success) return badRequest(res, parsed.error, "Invalid product");
 
   try {
-    const result = db.prepare("INSERT INTO products (user_id, name, price, aliases) VALUES (?, ?, ?, ?)")
-      .run(uid, parsed.data.name, parsed.data.price, parsed.data.aliases);
+    const result = db.prepare("INSERT INTO products (user_id, name, price, aliases, colors, sizes) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(uid, parsed.data.name, parsed.data.price, parsed.data.aliases, parsed.data.colors ?? "", parsed.data.sizes ?? "");
 
     return res.status(201).json(
-      db.prepare("SELECT id, name, price, aliases, created_at FROM products WHERE id = ?").get(result.lastInsertRowid)
+      db.prepare("SELECT id, name, price, aliases, colors, sizes, created_at FROM products WHERE id = ?").get(result.lastInsertRowid)
     );
   } catch (error) {
     if (isUniqueError(error)) return res.status(409).json({ error: "A product with this name already exists." });
@@ -559,11 +658,11 @@ app.patch("/api/products/:id", (req, res) => {
   if (!parsed.success) return badRequest(res, parsed.error, "Invalid product");
 
   try {
-    db.prepare("UPDATE products SET name = ?, price = ?, aliases = ? WHERE id = ? AND user_id = ?")
-      .run(parsed.data.name, parsed.data.price, parsed.data.aliases, id, uid);
+    db.prepare("UPDATE products SET name = ?, price = ?, aliases = ?, colors = COALESCE(?, colors), sizes = COALESCE(?, sizes) WHERE id = ? AND user_id = ?")
+      .run(parsed.data.name, parsed.data.price, parsed.data.aliases, parsed.data.colors ?? null, parsed.data.sizes ?? null, id, uid);
 
     return res.json(
-      db.prepare("SELECT id, name, price, aliases, created_at FROM products WHERE id = ?").get(id)
+      db.prepare("SELECT id, name, price, aliases, colors, sizes, created_at FROM products WHERE id = ?").get(id)
     );
   } catch (error) {
     if (isUniqueError(error)) return res.status(409).json({ error: "A product with this name already exists." });
