@@ -331,6 +331,60 @@ function orderMissing(uid, row, orderItems, { requireAddress = true, requireVari
   return { missing, variantAsks };
 }
 
+// Applies what the AI understood from the customer's message to the item lines of a draft:
+//   update = change a line (size, color, quantity, product), add = a new line, remove = delete a line.
+// Lines are numbered from 1 in the order they were created (same numbering the AI was shown).
+function applyLineChanges(orderId, changes) {
+  let applied = 0;
+
+  for (const change of changes.slice(0, 10)) {
+    const lines = db.prepare("SELECT * FROM order_items WHERE order_id = ? ORDER BY id").all(orderId);
+
+    if (change.action === "add") {
+      const parsed = itemSchema.safeParse({
+        product: change.product, quantity: change.quantity || 1,
+        color: change.color || "", size: change.size || "", unit_price: change.unit_price || 0
+      });
+      if (!parsed.success) continue;
+      insertItemStatement.run({ order_id: orderId, ...prepareItems([parsed.data])[0] });
+      applied++;
+      continue;
+    }
+
+    const line = lines[(change.line || 0) - 1];
+    if (!line) continue;
+
+    if (change.action === "remove") {
+      if (lines.length > 1) { db.prepare("DELETE FROM order_items WHERE id = ?").run(line.id); applied++; }
+      continue;
+    }
+
+    // update: only the fields the customer gave
+    const next = {
+      product: change.product || line.product,
+      quantity: change.quantity || line.quantity,
+      color: change.color || line.color || "",
+      size: change.size || line.size || "",
+      unit_price: change.product && change.product !== line.product ? (change.unit_price || 0) : line.unit_price
+    };
+    const variant = [next.color, next.size].filter(Boolean).join(" / ");
+
+    db.prepare(`
+      UPDATE order_items SET product = ?, quantity = ?, color = ?, size = ?, variant = ?, unit_price = ?
+      WHERE id = ? AND order_id = ?
+    `).run(next.product, next.quantity, next.color, next.size, variant, next.unit_price, line.id, orderId);
+    applied++;
+  }
+
+  if (applied) {
+    const all = db.prepare("SELECT product, variant, quantity, unit_price FROM order_items WHERE order_id = ? ORDER BY id").all(orderId);
+    db.prepare("UPDATE orders SET product = @product, variant = @variant, quantity = @quantity, unit_price = @unit_price WHERE id = @id")
+      .run({ ...summarizeItems(all), id: orderId });
+  }
+
+  return applied;
+}
+
 const pickValid = (schema, value) => {
   const parsed = schema.safeParse(value == null ? "" : String(value));
   return parsed.success ? parsed.data : "";
@@ -342,6 +396,8 @@ setAutoOrderHandler((uid, ctx) => {
       const tid = ctx.threadId;
       let row = null;
       let created = false;
+      let itemsChanged = false;
+      let fieldsChanged = false;
 
       if (ctx.openOrderId) {
         row = db.prepare(`
@@ -385,7 +441,10 @@ setAutoOrderHandler((uid, ctx) => {
         const set = { message: String(ctx.message || "").slice(0, 4000) };
 
         for (const key of ["customer_name", "phone", "city", "address"]) {
-          if (!row[key] && clean[key]) set[key] = clean[key];
+          // A follow-up message may CORRECT a detail ("wrong address, it is ..."): the AI only reads the new messages for it.
+          // Only a value the automation wrote itself may be corrected: a detail the seller edited by hand is never touched.
+          const mayOverwrite = ctx.autoFields && row[key] === (ctx.autoFields[key] ?? "");
+          if (clean[key] && (!row[key] || (mayOverwrite && clean[key] !== row[key]))) set[key] = clean[key];
         }
 
         // keys come from the fixed list above, never from the customer, so this is safe.
@@ -393,6 +452,12 @@ setAutoOrderHandler((uid, ctx) => {
           UPDATE orders SET ${Object.keys(set).map(k => `${k} = @${k}`).join(", ")}
           WHERE id = @id AND user_id = @uid AND meta_thread_id = @tid AND draft = 1
         `).run({ ...set, id: row.id, uid, tid });
+
+        // The AI's line operations (change a size, add a piece, remove a line) apply only while the seller has not edited the items.
+        if (ctx.changes?.length && ctx.replaceItems) {
+          itemsChanged = applyLineChanges(row.id, ctx.changes) > 0;
+        }
+        fieldsChanged = Object.keys(set).some(key => key !== "message");
 
         // Items follow the customer only while the seller has not changed them.
         if (ctx.replaceItems && items.length) {
@@ -424,6 +489,7 @@ setAutoOrderHandler((uid, ctx) => {
       const unpriced = !orderItems.length || orderItems.some(item => !(item.unit_price > 0));
 
       let complete = false;
+      let awaiting = false;
       let duplicate_id = null;
 
       if (!missing.length && ctx.canComplete && !unpriced) {
@@ -436,6 +502,11 @@ setAutoOrderHandler((uid, ctx) => {
 
         if (duplicate) {
           duplicate_id = duplicate.id; // the draft stays open: the seller decides
+        } else if (ctx.requireApproval && !(ctx.approved && !itemsChanged && !fieldsChanged)) {
+          awaiting = true; // everything is there: the customer must approve the summary first
+          if (name && name !== row.customer_name) {
+            db.prepare("UPDATE orders SET customer_name = ? WHERE id = ? AND user_id = ? AND draft = 1").run(name, row.id, uid);
+          }
         } else {
           db.prepare(`
             UPDATE orders SET draft = 0, customer_name = ?
@@ -445,7 +516,7 @@ setAutoOrderHandler((uid, ctx) => {
         }
       }
 
-      return { ok: true, order_id: row.id, created, complete, missing, variantAsks, unpriced, duplicate_id };
+      return { ok: true, order_id: row.id, created, complete, awaiting, itemsChanged, fieldsChanged, missing, variantAsks, unpriced, duplicate_id };
     })();
   } catch (error) {
     console.error("Auto order save error:", error);
