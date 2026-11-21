@@ -20,7 +20,7 @@ import { EventEmitter } from "node:events";
 import express from "express";
 import { z } from "zod";
 import { db } from "./db.js";
-import { analyzeMessage } from "./ai.js";
+import { analyzeMessage, analyzeTurn } from "./ai.js";
 import { badRequest, parseId, rateLimit } from "./util.js";
 
 // --------------------------------------------------
@@ -124,6 +124,7 @@ db.exec("CREATE INDEX IF NOT EXISTS idx_meta_conn_fbuser ON meta_connections(fb_
     ["order_id", "INTEGER"],
     ["order_cutoff", "INTEGER NOT NULL DEFAULT 0"],
     ["last_auto_reply", "TEXT NOT NULL DEFAULT ''"],
+    ["draft_fields", "TEXT NOT NULL DEFAULT ''"],  // name / phone / city / address as the automation last wrote them (to spot seller edits)
     ["draft_items", "TEXT NOT NULL DEFAULT ''"],   // what the automation last wrote into the open order's items
     ["last_result", "TEXT NOT NULL DEFAULT ''"],   // the AI's last reading of this conversation (shown without clicking)
     ["analyzed_upto", "INTEGER NOT NULL DEFAULT 0"], // last customer message already analysed
@@ -672,6 +673,37 @@ const FALLBACK = {
   afterOrder: "بالسلامة 🙏 كان تحب تزيد حاجة ابعثلنا."
 };
 
+// Summary the customer must approve BEFORE the order is registered.
+function summaryText(orderId) {
+  const order = db.prepare("SELECT customer_name, phone, city, address FROM orders WHERE id = ?").get(orderId) || {};
+  const items = db.prepare(
+    "SELECT product, variant, quantity, unit_price FROM order_items WHERE order_id = ? ORDER BY id"
+  ).all(orderId);
+
+  const lines = items.map(item => `- ${item.product}${item.variant ? ` (${item.variant})` : ""} × ${item.quantity}`).join("\n");
+  const total = Number(items.reduce((sum, item) => sum + item.quantity * item.unit_price, 0).toFixed(3));
+
+  return `📋 هاذي تفاصيل طلبيتك:\n${lines}\n` +
+    `👤 ${order.customer_name}\n📞 ${order.phone}\n📍 ${order.city}${order.address ? ` - ${order.address}` : ""}\n` +
+    `المجموع: ${total} د.ت\n\n` +
+    `واش كل شي صحيح؟ ✅ جاوبنا بـ "نعم" باش نأكدو الطلبية، ولا قولنا شنو تحب تبدل ✏️`;
+}
+
+const WHAT_TO_CHANGE = "ما فهمتش شنو غالط 🙏 قولنا شنو تحب تبدل (المنتج، المقاس، اللون، الكمية، العنوان...) وناخذو بالنا منو ✏️";
+
+// The customer gave a size / color for a line that already has one: change it, or one more piece?
+function clarifyText(line, change) {
+  const describe = (c, z) => [c || "", z || ""].filter(Boolean).join(" / ");
+  const old = describe(line.color, line.size);
+  const next = describe(change.color || line.color, change.size || line.size);
+
+  return `باش نتأكدو 🙏\nعندك ${line.product}${old ? ` (${old})` : ""} في الطلبية.\n` +
+    `تحب نبدلوه ل (${next || "..."}) ولا نزيدو قطعة أخرى (${next || "..."})؟\n` +
+    `جاوبنا بـ "بدل" ولا "زيد".`;
+}
+
+const YES_ONLY = /^(?:\s*(?:نعم|اي|ايه|إي|أي|ايوه|صحيح|موافق|باهي|ok|okay|oui|yes|ey|eyh|c bon|cbon|d'accord|daccord|tamam)[\s.!،,👍✅]*)+$/iu;
+
 const receivedText = orderId =>
   `✅ استلمنا طلبيتك (#${pad(orderId)})\nباش نتصلو بيك قريب للتأكيد. شكرا برشا 🙏`;
 
@@ -699,36 +731,6 @@ function aiBlockers(result, isNewDraft) {
   return blockers;
 }
 
-// The AI reads the whole conversation, so "hoodie M x2" followed by "taille L" can come back as two lines
-// of the same product. A later size / color for a product the customer already ordered is a CHANGE, not a
-// second item: keep ONE line per product + color, with the latest size and the biggest quantity.
-function mergeSameProduct(items) {
-  const merged = [];
-
-  for (const item of items) {
-    const key = String(item.product).trim().toLowerCase();
-    const color = String(item.color || "").trim().toLowerCase();
-    const size = String(item.size || "").trim();
-
-    const same = merged.find(m =>
-      m._key === key && (!m._color || !color || m._color === color)
-    );
-
-    if (!same) {
-      merged.push({ ...item, _key: key, _color: color });
-      continue;
-    }
-
-    same.quantity = Math.max(Number(same.quantity) || 1, Number(item.quantity) || 1);
-    if (size) same.size = size;
-    if (item.color) { same.color = item.color; same._color = color; }
-    if (item.unit_price) same.unit_price = item.unit_price;
-    same.variant = [same.color, same.size].filter(Boolean).join(" / ") || item.variant || same.variant || "";
-  }
-
-  return merged.map(({ _key, _color, ...rest }) => rest);
-}
-
 async function autoProcessThread(threadId) {
   const thread = db.prepare("SELECT * FROM meta_threads WHERE id = ?").get(threadId);
   if (!thread) return;
@@ -749,22 +751,83 @@ async function autoProcessThread(threadId) {
 
   const products = db.prepare("SELECT id, name, price, aliases FROM products WHERE user_id = ? ORDER BY name").all(uid);
 
+  // This conversation has an open draft only if it says so AND the order is still a pending draft (checked again by the database).
+  const isOpen = Boolean(thread.order_id) &&
+    ["draft", "needs_review", "awaiting_confirm"].includes(thread.auto_status);
+
+  const awaitingApproval = isOpen && thread.auto_status === "awaiting_confirm";
+  const turnMode = isOpen;
+
   let result;
-  try {
-    result = await analyzeMessage(text, { products });
-  } catch (error) {
-    console.error("Auto order: AI analysis failed:", error.message);
-    return;
+  let changes = [];
+  let approvedByCustomer = false;
+  let clarify = null;
+  let refused = false;
+
+  if (turnMode) {
+    // ---- follow-up of an open order: the AI sees the order lines + the conversation (customer AND shop)
+    const newRows = rows.filter(row => row.id > (thread.analyzed_upto || 0));
+    if (!newRows.length) return;
+
+    const orderRow = db.prepare("SELECT customer_name, phone, city, address FROM orders WHERE id = ?").get(thread.order_id);
+    const lines = db.prepare("SELECT product, quantity, color, size FROM order_items WHERE order_id = ? ORDER BY id").all(thread.order_id);
+
+    const firstNew = newRows[0].id;
+    const history = db.prepare(
+      "SELECT id, direction, text FROM meta_messages WHERE thread_id = ? AND id > ? ORDER BY id DESC LIMIT 14"
+    ).all(thread.id, thread.order_cutoff || 0).reverse();
+
+    const transcript = [];
+    let marked = false;
+    for (const message of history) {
+      if (!marked && message.direction === "in" && message.id >= firstNew) {
+        transcript.push("--- NEW MESSAGES ---");
+        marked = true;
+      }
+      transcript.push(`${message.direction === "in" ? "CUSTOMER" : "SHOP"}: ${String(message.text).slice(0, 500)}`);
+    }
+
+    const newText = newRows.map(row => row.text).join("\n");
+
+    try {
+      result = await analyzeTurn(transcript.join("\n"), {
+        products,
+        order: { customer: orderRow || {}, lines },
+        newText
+      });
+    } catch (error) {
+      console.error("Auto order: AI analysis failed:", error.message);
+
+      // The AI is down: a plain "yes / نعم" can still approve the summary the customer was shown.
+      if (!(awaitingApproval && YES_ONLY.test(newText))) return;
+      result = { provider: "plain-yes", extracted: {}, changes: [], confirmation: "yes", customer_intent: "other", confidence: 1 };
+    }
+
+    changes = result.changes || [];
+    approvedByCustomer = awaitingApproval && result.confirmation === "yes";
+    refused = awaitingApproval && result.confirmation === "no" && !changes.length;
+
+    // Same size / color asked twice: change it, or one more piece? Ask instead of guessing.
+    if (result.clarify && changes.length) {
+      const change = changes[0];
+      const line = lines[(change.line || 0) - 1];
+      if (change.action === "update" && line) clarify = clarifyText(line, change);
+      if (clarify) changes = []; // nothing is touched until the customer answers
+    }
+  } else {
+    try {
+      result = await analyzeMessage(text, { products });
+    } catch (error) {
+      console.error("Auto order: AI analysis failed:", error.message);
+      return;
+    }
   }
 
-  const items = mergeSameProduct((result.items || []).filter(item => item.product));
+  const items = (result.items || []).filter(item => item.product);
   const intent = result.customer_intent;
   const extracted = result.extracted || {};
 
-  // This conversation has an open draft only if it says so AND the order is still a pending draft (checked again by the database).
-  const isOpen = Boolean(thread.order_id) && (thread.auto_status === "draft" || thread.auto_status === "needs_review");
-
-  const summary = JSON.stringify({
+  let summary = JSON.stringify({
     intent,
     confidence: result.confidence ?? null,
     extracted: {
@@ -773,13 +836,15 @@ async function autoProcessThread(threadId) {
       city: extracted.city || "",
       address: extracted.address || ""
     },
-    items: items.map(item => ({ product: item.product, quantity: item.quantity || 1, variant: item.variant || "" }))
+    items: turnMode
+      ? changes.map(c => ({ product: c.product || "", quantity: c.quantity || 1, variant: [c.color, c.size].filter(Boolean).join(" / "), action: c.action }))
+      : items.map(item => ({ product: item.product, quantity: item.quantity || 1, variant: item.variant || "" }))
   });
 
   const chatOn = process.env.META_AUTO_REPLY_CHAT !== "0";
 
   // ---------- Not an order (and no draft waiting): chat or a question ----------
-  if (!isOpen && (!items.length || intent === "question" || intent === "complaint")) {
+  if (!turnMode && (!items.length || intent === "question" || intent === "complaint")) {
     const finished = thread.auto_status === "order_created"; // keep the badge of the order just saved
 
     db.prepare("UPDATE meta_threads SET auto_status = ?, auto_note = ?, analyzed_upto = ?, last_result = ? WHERE id = ?")
@@ -814,7 +879,7 @@ async function autoProcessThread(threadId) {
       city: extracted.city,
       address: extracted.address
     },
-    items: items.map(item => ({
+    items: turnMode ? [] : items.map(item => ({
       product: item.product,
       variant: item.variant || "",
       color: item.color || "",
@@ -822,6 +887,10 @@ async function autoProcessThread(threadId) {
       quantity: item.quantity || 1,
       unit_price: item.unit_price || 0
     })),
+    changes,
+    autoFields: turnMode ? (() => { try { return JSON.parse(thread.draft_fields || "null"); } catch { return null; } })() : null,
+    approved: approvedByCustomer,
+    requireApproval: process.env.META_AUTO_CONFIRM !== "0",
     message: text,
     source: SOURCE_NAME[connection.platform] || "manual",
     replaceItems: Boolean(openOrderId) && itemsSnapshot(openOrderId) === thread.draft_items,
@@ -869,6 +938,12 @@ async function autoProcessThread(threadId) {
   if (out.complete) {
     status = "order_created";
     note = "";
+  } else if (out.awaiting && !issues.length) {
+    status = "awaiting_confirm";
+    note = "waiting for the customer to approve the summary";
+  } else if (clarify && !issues.length) {
+    status = "draft";
+    note = "waiting for the customer: change the existing line or add one more piece?";
   } else if (issues.length) {
     status = "needs_review";
     note = [...issues, waiting].filter(Boolean).join(" · ");
@@ -877,15 +952,21 @@ async function autoProcessThread(threadId) {
     note = waiting;
   }
 
+  if (turnMode) {
+    const current = db.prepare("SELECT product, variant, quantity FROM order_items WHERE order_id = ? ORDER BY id").all(orderId);
+    summary = JSON.stringify({ ...JSON.parse(summary), items: current.map(i => ({ product: i.product, quantity: i.quantity, variant: i.variant || "" })) });
+  }
+
   db.prepare(`
     UPDATE meta_threads
     SET auto_status = ?, auto_note = ?, order_id = ?, analyzed_upto = ?, last_result = ?,
-        order_cutoff = ?, draft_items = ?
+        order_cutoff = ?, draft_items = ?, draft_fields = ?
     WHERE id = ?
   `).run(
     status, note, orderId, lastId, summary,
     out.complete ? lastId : thread.order_cutoff,   // a finished order closes: the next one starts after it
     out.complete ? "" : itemsSnapshot(orderId),
+    out.complete ? "" : JSON.stringify(db.prepare("SELECT customer_name, phone, city, address FROM orders WHERE id = ?").get(orderId) || {}),
     thread.id
   );
 
@@ -899,6 +980,11 @@ async function autoProcessThread(threadId) {
   //   complete but to be checked (catalog, price, duplicate, AI doubt) -> "received, we will call you"
   if (out.complete) {
     await autoReply(connection, thread.id, confirmationText(orderId));
+  } else if (clarify) {
+    await autoReply(connection, thread.id, clarify);
+  } else if (out.awaiting && !issues.length) {
+    const answer = intent === "question" && chatOn ? `${chatAnswer(result, intent, false)}\n\n` : "";
+    await autoReply(connection, thread.id, refused ? WHAT_TO_CHANGE : `${answer}${summaryText(orderId)}`);
   } else if (missing.length) {
     const ask = askText(missing, out.variantAsks);
     await autoReply(connection, thread.id, intent === "question" && chatOn ? `${chatAnswer(result, intent, false)}\n\n${ask}` : ask);
