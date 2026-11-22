@@ -27,7 +27,7 @@ const graph = http.createServer((req, res) => {
 });
 await new Promise(r => graph.listen(0, "127.0.0.1", r));
 
-tempDb();
+await tempDb();
 Object.assign(process.env, {
   META_APP_ID: "123", META_APP_SECRET: "secret", META_VERIFY_TOKEN: "verify-me",
   META_REDIRECT_URI: "https://api.example.com/api/meta/callback",
@@ -38,18 +38,21 @@ Object.assign(process.env, {
 
 const groq = await fakeGroq();
 const { app, db } = await import("./server.js");
+const { webhooksIdle } = await import("./meta.js");
 const { server, base, call } = await listen(app);
 
 let T;
 const api = (m, p, b) => call(m, p, b, T);
 
-const signed = payload => {
+const signed = async payload => {
   const raw = JSON.stringify(payload);
-  return fetch(`${base}/api/meta/webhook`, {
+  const response = await fetch(`${base}/api/meta/webhook`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-hub-signature-256": "sha256=" + crypto.createHmac("sha256", "secret").update(raw).digest("hex") },
     body: raw
   });
+  await webhooksIdle(); // the server answers first, then stores the message
+  return response;
 };
 
 const inbound = (mid, text, ts = Date.now()) => ({
@@ -61,7 +64,7 @@ before(async () => {
   const r = await call("POST", "/api/auth/register", { name: "Sara", store_name: "Shop", email: "s@test.com", password: "password123" });
   T = r.body.token;
 });
-after(() => { server.close(); graph.close(); groq.server.close(); db.close(); });
+after(async () => { server.close(); graph.close(); groq.server.close(); await db.close(); });
 
 test("connect needs login, then OAuth callback stores Page + Instagram", async () => {
   assert.equal((await call("POST", "/api/meta/connect")).status, 401);
@@ -84,7 +87,7 @@ test("connect needs login, then OAuth callback stores Page + Instagram", async (
   assert.deepEqual(status.body.connections.map(c => c.platform), ["facebook", "instagram"]);
 
   // Token is encrypted in the database and never returned by the API.
-  const row = db.prepare("SELECT token_enc FROM meta_connections").get();
+  const row = await db.prepare("SELECT token_enc FROM meta_connections").get();
   assert.ok(!row.token_enc.includes("PAGE_TOKEN"));
   assert.ok(!JSON.stringify(status.body).includes("token"));
 });
@@ -134,14 +137,13 @@ test("reply goes through Meta and the echo is not duplicated", async () => {
 
 test("24-hour window blocks late replies; another seller cannot see the thread", async () => {
   const [t] = (await api("GET", "/api/meta/threads")).body;
-  db.prepare("UPDATE meta_threads SET last_inbound_at = ? WHERE id = ?").run(Date.now() - 25 * 3600_000, t.id);
+  await db.prepare("UPDATE meta_threads SET last_inbound_at = ? WHERE id = ?").run(Date.now() - 25 * 3600_000, t.id);
   assert.equal((await api("POST", `/api/meta/threads/${t.id}/reply`, { text: "late" })).status, 409);
 
-  db.prepare("UPDATE users SET id = id").run();
-  db.prepare("INSERT INTO users (email, name, store_name, password_hash) VALUES ('o@t.com','O','O','x')").run();
-  const other = db.prepare("SELECT id FROM users WHERE email='o@t.com'").get().id;
+  await db.prepare("INSERT INTO users (email, name, store_name, password_hash) VALUES ('o@t.com','O','O','x')").run();
+  const other = (await db.prepare("SELECT id FROM users WHERE email='o@t.com'").get()).id;
   const tok = "othertoken";
-  db.prepare("INSERT INTO sessions (user_id, token_hash, expires_at) VALUES (?, ?, ?)")
+  await db.prepare("INSERT INTO sessions (user_id, token_hash, expires_at) VALUES (?, ?, ?)")
     .run(other, crypto.createHash("sha256").update(tok).digest("hex"), Date.now() + 100000);
   assert.equal((await call("GET", `/api/meta/threads/${t.id}/messages`, undefined, tok)).status, 404);
   assert.equal((await call("GET", "/api/meta/threads", undefined, tok)).body.length, 0);
@@ -218,7 +220,7 @@ test("deauthorize and data-deletion callbacks verify the signature", async () =>
 
   assert.equal((await api("GET", "/api/meta/status")).body.connections.length, 0);
   assert.equal((await api("GET", "/api/meta/threads")).body.length, 0);
-  assert.equal(db.prepare("SELECT COUNT(*) n FROM meta_messages").get().n, 0);
+  assert.equal((await db.prepare("SELECT COUNT(*) n FROM meta_messages").get()).n, 0);
 
   const page = await fetch(`${base}/api/meta/deletion-status?code=${out.confirmation_code}`);
   assert.equal(page.status, 200);
