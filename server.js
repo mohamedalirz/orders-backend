@@ -7,6 +7,7 @@ import "dotenv/config";
 
 import { db, isUniqueViolation } from "./db.js";
 import { authRouter, requireAuth } from "./auth.js";
+import { adminRouter, requireAdmin } from "./admin.js";
 import { analyzeMessage } from "./ai.js";
 import { metaPublicRouter, metaRouter, setAutoOrderHandler } from "./meta.js";
 import { normalizePhone, isValidTnPhone } from "./tunisia.js";
