@@ -1,13 +1,22 @@
 // Shared by the test files: a fake Groq server and small HTTP helpers.
 import http from "node:http";
-import os from "node:os";
-import path from "node:path";
-import fs from "node:fs";
+import pg from "pg";
 
-export function tempDb() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "orders-"));
-  process.env.DB_PATH = path.join(dir, "t.db");
-  return process.env.DB_PATH;
+// Every test file gets its own empty Postgres database.
+// TEST_DATABASE_URL = a Postgres server you can create databases on (default: local, user postgres).
+export async function tempDb() {
+  const admin = process.env.TEST_DATABASE_URL || "postgresql://postgres@127.0.0.1:5432/postgres";
+  const name = `t_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+  const client = new pg.Client({ connectionString: admin });
+  await client.connect();
+  await client.query(`CREATE DATABASE ${name}`);
+  await client.end();
+
+  const url = new URL(admin);
+  url.pathname = `/${name}`;
+  process.env.DATABASE_URL = url.toString();
+  return name;
 }
 
 export async function fakeGroq() {
