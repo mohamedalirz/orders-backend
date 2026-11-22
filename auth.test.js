@@ -1,33 +1,16 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import Database from "better-sqlite3";
 import { tempDb, listen } from "./testkit.js";
 
-// An OLD database, from before accounts existed: global-unique products, orders without owner.
-const file = tempDb();
-{
-  const old = new Database(file);
-  old.exec(`
-    CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT, customer_name TEXT NOT NULL, phone TEXT NOT NULL, city TEXT NOT NULL,
-      address TEXT DEFAULT '', product TEXT NOT NULL, variant TEXT DEFAULT '', quantity INTEGER NOT NULL DEFAULT 1,
-      unit_price REAL NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending', delivery_status TEXT NOT NULL DEFAULT 'not_sent',
-      cod_status TEXT NOT NULL DEFAULT 'not_received', source TEXT NOT NULL DEFAULT 'manual', message TEXT DEFAULT '',
-      risk_level TEXT NOT NULL DEFAULT 'low', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-      price REAL NOT NULL DEFAULT 0, aliases TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-    INSERT INTO orders (customer_name, phone, city, product, quantity, unit_price) VALUES ('Old Customer', '+216 22 123 456', 'Tunis', 'Robe', 1, 59);
-    INSERT INTO products (name, price) VALUES ('Robe', 59);
-  `);
-  old.close();
-}
+await tempDb();
 
 const { app, db } = await import("./server.js");
 const { server, call } = await listen(app);
-after(() => { server.close(); db.close(); });
+after(async () => { server.close(); await db.close(); });
 
 const ana = { name: "Ana", store_name: "Ana Store", email: "Ana@Test.com", password: "password123" };
 
-test("old database is upgraded and still unreadable without login", async () => {
+test("data is unreadable without login", async () => {
   assert.equal((await call("GET", "/api/orders")).status, 401);
   const status = await call("GET", "/api/auth/status");
   assert.deepEqual(status.body, { hasUsers: false, signupOpen: true });
@@ -41,7 +24,7 @@ test("registration validation", async () => {
 
 let tokenAna;
 
-test("first account takes over the old data", async () => {
+test("registration works, never returns the password hash", async () => {
   const r = await call("POST", "/api/auth/register", ana);
   assert.equal(r.status, 201);
   assert.equal(r.body.user.email, "ana@test.com");
@@ -49,36 +32,49 @@ test("first account takes over the old data", async () => {
   assert.equal(r.body.user.password_hash, undefined);
   tokenAna = r.body.token;
 
+  // Ana's data, used by the next tests.
+  assert.equal((await call("POST", "/api/products", { name: "Robe", price: 59 }, tokenAna)).status, 201);
+  assert.equal((await call("POST", "/api/orders", { customer_name: "Old Customer", phone: "+216 22 123 456", city: "Tunis",
+    items: [{ product: "Robe", quantity: 1, unit_price: 59 }] }, tokenAna)).status, 201);
+
   const orders = await call("GET", "/api/orders", undefined, tokenAna);
   assert.equal(orders.body.length, 1);
-  assert.equal(orders.body[0].customer_name, "Old Customer");
-  assert.equal(orders.body[0].phone, "22123456"); // normalized by the upgrade
+  assert.equal(orders.body[0].phone, "22123456"); // normalized
   assert.equal((await call("GET", "/api/products", undefined, tokenAna)).body.length, 1);
 });
 
-test("password is stored hashed, token only as a hash", () => {
-  const user = db.prepare("SELECT * FROM users").get();
+test("password is stored hashed, token only as a hash", async () => {
+  const user = await db.prepare("SELECT * FROM users").get();
   assert.match(user.password_hash, /^scrypt\$/);
   assert.ok(!user.password_hash.includes("password123"));
-  const s = db.prepare("SELECT * FROM sessions").get();
+  const s = await db.prepare("SELECT * FROM sessions").get();
   assert.notEqual(s.token_hash, tokenAna);
   assert.equal(s.token_hash.length, 64);
 });
 
-test("sign-ups closed after the first account, open with ALLOW_SIGNUP=1", async () => {
+test("anyone can sign up (many sellers); ALLOW_SIGNUP=0 closes it", async () => {
   const other = { name: "Ben", store_name: "Ben Shop", email: "ben@test.com", password: "password123" };
+  assert.equal((await call("GET", "/api/auth/status")).body.signupOpen, true);
+  assert.equal((await call("POST", "/api/auth/register", { ...other, email: "ANA@test.com" })).status, 409);
+
+  process.env.ALLOW_SIGNUP = "0";
   assert.equal((await call("GET", "/api/auth/status")).body.signupOpen, false);
   assert.equal((await call("POST", "/api/auth/register", other)).status, 403);
+  delete process.env.ALLOW_SIGNUP;
 
-  process.env.ALLOW_SIGNUP = "1";
-  assert.equal((await call("POST", "/api/auth/register", { ...other, email: "ANA@test.com" })).status, 409);
   const r = await call("POST", "/api/auth/register", other);
   assert.equal(r.status, 201);
-  process.env.ALLOW_SIGNUP = "";
 
   // Ben starts empty and cannot see Ana's data.
   assert.equal((await call("GET", "/api/orders", undefined, r.body.token)).body.length, 0);
   assert.equal((await call("GET", "/api/products", undefined, r.body.token)).body.length, 0);
+});
+
+test("many sellers can register at the same time", async () => {
+  const results = await Promise.all(Array.from({ length: 3 }, (_, i) =>
+    call("POST", "/api/auth/register", { name: `U${i}`, store_name: `S${i}`, email: `u${i}@test.com`, password: "password123" })));
+  assert.deepEqual(results.map(r => r.status), Array(3).fill(201));
+  assert.equal(new Set(results.map(r => r.body.user.id)).size, 3);
 });
 
 test("accounts are isolated from each other", async () => {
@@ -129,7 +125,7 @@ test("logout kills the token", async () => {
 
 test("expired session is refused", async () => {
   const t = (await call("POST", "/api/auth/login", { email: "ana@test.com", password: "password123" })).body.token;
-  db.prepare("UPDATE sessions SET expires_at = ?").run(Date.now() - 1000);
+  await db.prepare("UPDATE sessions SET expires_at = ?").run(Date.now() - 1000);
   assert.equal((await call("GET", "/api/auth/me", undefined, t)).status, 401);
   // restore a valid session for the next tests
   tokenAna = (await call("POST", "/api/auth/login", { email: "ana@test.com", password: "password123" })).body.token;
