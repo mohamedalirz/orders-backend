@@ -307,6 +307,8 @@ CREATE TABLE IF NOT EXISTS meta_deletions (
   created_at TEXT NOT NULL DEFAULT ${NOW}
 );
 
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TEXT NOT NULL DEFAULT '';
+
 CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_orders_phone ON orders(user_id, phone);
 CREATE INDEX IF NOT EXISTS idx_orders_meta_thread ON orders(meta_thread_id);
