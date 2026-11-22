@@ -2,7 +2,7 @@ import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
 import { tempDb, fakeGroq, listen } from "./testkit.js";
 
-tempDb();
+await tempDb();
 const groq = await fakeGroq();
 const { app, db } = await import("./server.js");
 const { server, call } = await listen(app);
@@ -17,7 +17,7 @@ before(async () => {
   await api("POST", "/api/products", { name: "Robe Lina", price: 59, aliases: "robe lina, روبة لينا" });
   await api("POST", "/api/products", { name: "Sac handmade", price: 45, aliases: "sac, sacs" });
 });
-after(() => { server.close(); groq.server.close(); db.close(); });
+after(async () => { server.close(); groq.server.close(); await db.close(); });
 
 const order = (o = {}) => ({
   customer_name: "Test", phone: "+216 22 123 456", city: "Tunis",
