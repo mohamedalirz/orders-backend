@@ -50,101 +50,9 @@ const MESSAGING_WINDOW_MS = 24 * 3600 * 1000;
 // DATABASE
 // --------------------------------------------------
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS meta_oauth_states (
-  state TEXT PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  expires_at INTEGER NOT NULL
-);
+// The tables (meta_connections, meta_threads, meta_messages...) are created in db.js.
 
--- One row per connected Facebook Page or Instagram account.
--- account_id = Page id (facebook) or Instagram business account id (instagram).
-CREATE TABLE IF NOT EXISTS meta_connections (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  platform TEXT NOT NULL CHECK (platform IN ('facebook', 'instagram')),
-  account_id TEXT NOT NULL,
-  page_id TEXT NOT NULL,
-  name TEXT NOT NULL DEFAULT '',
-  token_enc TEXT NOT NULL,
-  fb_user_id TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'active',
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (platform, account_id)
-);
-
-CREATE TABLE IF NOT EXISTS meta_threads (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  connection_id INTEGER NOT NULL REFERENCES meta_connections(id) ON DELETE CASCADE,
-  customer_id TEXT NOT NULL,
-  customer_name TEXT NOT NULL DEFAULT '',
-  last_message TEXT NOT NULL DEFAULT '',
-  last_message_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  last_inbound_at INTEGER NOT NULL DEFAULT 0,
-  unread INTEGER NOT NULL DEFAULT 0,
-  UNIQUE (connection_id, customer_id)
-);
-
-CREATE TABLE IF NOT EXISTS meta_messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  thread_id INTEGER NOT NULL REFERENCES meta_threads(id) ON DELETE CASCADE,
-  mid TEXT NOT NULL,
-  direction TEXT NOT NULL CHECK (direction IN ('in', 'out')),
-  text TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (thread_id, mid)
-);
-
-CREATE TABLE IF NOT EXISTS meta_deletions (
-  code TEXT PRIMARY KEY,
-  fb_user_id TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_meta_conn_user ON meta_connections(user_id);
-CREATE INDEX IF NOT EXISTS idx_meta_threads_user ON meta_threads(user_id, last_message_at);
-CREATE INDEX IF NOT EXISTS idx_meta_msgs_thread ON meta_messages(thread_id, id);
-`);
-
-// Databases created by an earlier version of this file: add the new column.
-if (!db.prepare("PRAGMA table_info(meta_connections)").all().some(c => c.name === "fb_user_id")) {
-  db.exec("ALTER TABLE meta_connections ADD COLUMN fb_user_id TEXT NOT NULL DEFAULT ''");
-}
-db.exec("CREATE INDEX IF NOT EXISTS idx_meta_conn_fbuser ON meta_connections(fb_user_id)");
-
-// Automatic order detection: where each conversation stands.
-//   auto_status  '' | 'order_created' | 'needs_review' | 'not_order'
-//   order_cutoff last customer message already used for an order (the next order starts after it)
-{
-  const have = db.prepare("PRAGMA table_info(meta_threads)").all().map(c => c.name);
-  for (const [name, definition] of [
-    ["auto_status", "TEXT NOT NULL DEFAULT ''"],
-    ["auto_note", "TEXT NOT NULL DEFAULT ''"],
-    ["order_id", "INTEGER"],
-    ["order_cutoff", "INTEGER NOT NULL DEFAULT 0"],
-    ["last_auto_reply", "TEXT NOT NULL DEFAULT ''"],
-    ["draft_fields", "TEXT NOT NULL DEFAULT ''"],  // name / phone / city / address as the automation last wrote them (to spot seller edits)
-    ["draft_items", "TEXT NOT NULL DEFAULT ''"],   // what the automation last wrote into the open order's items
-    ["last_result", "TEXT NOT NULL DEFAULT ''"],   // the AI's last reading of this conversation (shown without clicking)
-    ["analyzed_upto", "INTEGER NOT NULL DEFAULT 0"], // last customer message already analysed
-    ["reply_error", "TEXT NOT NULL DEFAULT ''"]      // why the last automatic reply could not be sent (shown in the app)
-  ]) {
-    if (!have.includes(name)) db.exec(`ALTER TABLE meta_threads ADD COLUMN ${name} ${definition}`);
-  }
-}
-
-// An order built from a conversation remembers WHICH conversation it belongs to, and whether it is still
-// a draft waiting for the customer. The automation only ever edits orders with draft = 1 that carry
-// the id of the conversation it is working on.
-{
-  const have = db.prepare("PRAGMA table_info(orders)").all().map(c => c.name);
-  if (!have.includes("meta_thread_id")) db.exec("ALTER TABLE orders ADD COLUMN meta_thread_id INTEGER");
-  if (!have.includes("draft")) db.exec("ALTER TABLE orders ADD COLUMN draft INTEGER NOT NULL DEFAULT 0");
-  db.exec("CREATE INDEX IF NOT EXISTS idx_orders_meta_thread ON orders(meta_thread_id)");
-}
-
-db.prepare("DELETE FROM meta_oauth_states WHERE expires_at < ?").run(Date.now());
+await db.prepare("DELETE FROM meta_oauth_states WHERE expires_at < ?").run(Date.now());
 
 // --------------------------------------------------
 // TOKEN ENCRYPTION (AES-256-GCM). Page tokens give full control of a Page,
@@ -233,10 +141,10 @@ const upsertConnection = db.prepare(`
     WHERE meta_connections.user_id = excluded.user_id
 `);
 
-function markNeedsReconnect(error, connection) {
+async function markNeedsReconnect(error, connection) {
   // 190 = token expired or revoked (seller changed password, removed the app...).
   if (error?.code === 190) {
-    db.prepare("UPDATE meta_connections SET status = 'needs_reconnect' WHERE page_id = ?").run(connection.page_id);
+    await db.prepare("UPDATE meta_connections SET status = 'needs_reconnect' WHERE page_id = ?").run(connection.page_id);
   }
 }
 
@@ -272,8 +180,8 @@ metaPublicRouter.get("/callback", async (req, res) => {
 
   // The state ties this callback to the seller who started it, and works only once.
   const state = String(req.query.state || "");
-  const row = state && db.prepare("SELECT * FROM meta_oauth_states WHERE state = ?").get(state);
-  if (row) db.prepare("DELETE FROM meta_oauth_states WHERE state = ?").run(state);
+  const row = state && await db.prepare("SELECT * FROM meta_oauth_states WHERE state = ?").get(state);
+  if (row) await db.prepare("DELETE FROM meta_oauth_states WHERE state = ?").run(state);
   if (!row || row.expires_at < Date.now()) return back("invalid_state");
 
   const code = String(req.query.code || "");
@@ -320,13 +228,13 @@ metaPublicRouter.get("/callback", async (req, res) => {
         continue;
       }
 
-      connected += upsertConnection.run({ ...base, platform: "facebook", account_id: page.id, name: page.name }).changes;
+      connected += (await upsertConnection.run({ ...base, platform: "facebook", account_id: page.id, name: page.name })).changes;
 
       const ig = page.instagram_business_account;
       if (ig?.id) {
-        connected += upsertConnection.run({
+        connected += (await upsertConnection.run({
           ...base, platform: "instagram", account_id: ig.id, name: ig.username ? `@${ig.username}` : page.name
-        }).changes;
+        })).changes;
       }
     }
 
@@ -374,11 +282,7 @@ metaPublicRouter.post("/webhook", express.raw({ type: "*/*", limit: "1mb" }), (r
   // Answer fast: Meta retries (and eventually disables the webhook) if we are slow.
   res.status(200).send("EVENT_RECEIVED");
 
-  try {
-    processWebhook(payload);
-  } catch (error) {
-    console.error("Meta webhook processing error:", error);
-  }
+  processWebhook(payload);
 });
 
 metaPublicRouter.get("/stream", (req, res) => {
@@ -433,31 +337,31 @@ export function parseSignedRequest(signedRequest, secret) {
 const formBody = express.urlencoded({ extended: false, limit: "100kb" });
 
 // The seller removed the app inside Facebook: we can no longer use their tokens.
-metaPublicRouter.post("/deauthorize", formBody, (req, res) => {
+metaPublicRouter.post("/deauthorize", formBody, async (req, res) => {
   const data = parseSignedRequest(req.body?.signed_request, cfg().appSecret);
   if (!data) return res.sendStatus(400);
 
-  const users = db.prepare("SELECT DISTINCT user_id FROM meta_connections WHERE fb_user_id = ?").all(data.user_id);
+  const users = await db.prepare("SELECT DISTINCT user_id FROM meta_connections WHERE fb_user_id = ?").all(data.user_id);
 
-  db.prepare("UPDATE meta_connections SET status = 'needs_reconnect' WHERE fb_user_id = ?").run(data.user_id);
+  await db.prepare("UPDATE meta_connections SET status = 'needs_reconnect' WHERE fb_user_id = ?").run(data.user_id);
   for (const u of users) emit(u.user_id, { type: "connections_changed" });
 
   res.sendStatus(200);
 });
 
 // The seller asked Facebook to delete their data: we delete everything we hold for that Facebook user.
-metaPublicRouter.post("/data-deletion", formBody, (req, res) => {
+metaPublicRouter.post("/data-deletion", formBody, async (req, res) => {
   const data = parseSignedRequest(req.body?.signed_request, cfg().appSecret);
   if (!data) return res.sendStatus(400);
 
-  const users = db.prepare("SELECT DISTINCT user_id FROM meta_connections WHERE fb_user_id = ?").all(data.user_id);
+  const users = await db.prepare("SELECT DISTINCT user_id FROM meta_connections WHERE fb_user_id = ?").all(data.user_id);
 
   // Tokens, conversations and messages go away (ON DELETE CASCADE).
-  db.prepare("DELETE FROM meta_connections WHERE fb_user_id = ?").run(data.user_id);
+  await db.prepare("DELETE FROM meta_connections WHERE fb_user_id = ?").run(data.user_id);
   for (const u of users) emit(u.user_id, { type: "connections_changed" });
 
   const code = crypto.randomBytes(12).toString("hex");
-  db.prepare("INSERT INTO meta_deletions (code, fb_user_id) VALUES (?, ?)").run(code, data.user_id);
+  await db.prepare("INSERT INTO meta_deletions (code, fb_user_id) VALUES (?, ?)").run(code, data.user_id);
 
   const origin = (() => { try { return new URL(cfg().redirectUri).origin; } catch { return ""; } })();
 
@@ -465,8 +369,8 @@ metaPublicRouter.post("/data-deletion", formBody, (req, res) => {
   res.json({ url: `${origin}/api/meta/deletion-status?code=${code}`, confirmation_code: code });
 });
 
-metaPublicRouter.get("/deletion-status", (req, res) => {
-  const row = db.prepare("SELECT created_at FROM meta_deletions WHERE code = ?").get(String(req.query.code || ""));
+metaPublicRouter.get("/deletion-status", async (req, res) => {
+  const row = await db.prepare("SELECT created_at FROM meta_deletions WHERE code = ?").get(String(req.query.code || ""));
 
   res.type("html").status(row ? 200 : 404).send(
     row
@@ -485,28 +389,28 @@ const upsertThread = db.prepare(`
 `);
 
 const insertMessage = db.prepare(
-  "INSERT OR IGNORE INTO meta_messages (thread_id, mid, direction, text, created_at) VALUES (?, ?, ?, ?, ?)"
+  "INSERT INTO meta_messages (thread_id, mid, direction, text, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (thread_id, mid) DO NOTHING"
 );
 
-const storeMessage = db.transaction((connection, customerId, mid, direction, text, timestamp) => {
-  upsertThread.run(connection.user_id, connection.id, customerId);
+const storeMessage = db.transaction(async (connection, customerId, mid, direction, text, timestamp) => {
+  await upsertThread.run(connection.user_id, connection.id, customerId);
 
-  const thread = db.prepare("SELECT * FROM meta_threads WHERE connection_id = ? AND customer_id = ?")
+  const thread = await db.prepare("SELECT * FROM meta_threads WHERE connection_id = ? AND customer_id = ?")
     .get(connection.id, customerId);
 
-  const stored = insertMessage.run(thread.id, mid, direction, text, new Date(timestamp).toISOString());
+  const stored = await insertMessage.run(thread.id, mid, direction, text, new Date(timestamp).toISOString());
 
   // changes = 0 means Meta sent the same message twice (it retries): ignore it.
   if (!stored.changes) return null;
 
   if (direction === "in") {
-    db.prepare(`
+    await db.prepare(`
       UPDATE meta_threads
       SET last_message = ?, last_message_at = ?, last_inbound_at = ?, unread = unread + 1
       WHERE id = ?
     `).run(text.slice(0, 200), new Date(timestamp).toISOString(), timestamp, thread.id);
   } else {
-    db.prepare("UPDATE meta_threads SET last_message = ?, last_message_at = ? WHERE id = ?")
+    await db.prepare("UPDATE meta_threads SET last_message = ?, last_message_at = ? WHERE id = ?")
       .run(text.slice(0, 200), new Date(timestamp).toISOString(), thread.id);
   }
 
@@ -526,7 +430,7 @@ async function sendText(connection, thread, text) {
   });
 
   // Saved with Meta's message id, so the "echo" webhook that follows is recognised as a duplicate.
-  storeMessage(connection, thread.customer_id, sent.message_id, "out", text, Date.now());
+  await storeMessage(connection, thread.customer_id, sent.message_id, "out", text, Date.now());
   emit(connection.user_id, { type: "message", thread_id: thread.id, direction: "out" });
 
   return sent;
@@ -615,8 +519,8 @@ const askText = (fields, variantAsks = []) => {
   return `مرحبا 👋 باش نكمل الطلبية متاعك نحتاج:\n${lines.join("\n")}\nبرشا شكرا!`;
 };
 
-function confirmationText(orderId) {
-  const items = db.prepare(
+async function confirmationText(orderId) {
+  const items = await db.prepare(
     "SELECT product, variant, quantity, unit_price FROM order_items WHERE order_id = ? ORDER BY id"
   ).all(orderId);
 
@@ -629,8 +533,8 @@ function confirmationText(orderId) {
 }
 
 // What the automation last wrote into an order's items: if they still match, the seller has not changed them.
-const itemsSnapshot = orderId => JSON.stringify(
-  db.prepare("SELECT product, variant, quantity FROM order_items WHERE order_id = ? ORDER BY id").all(orderId)
+const itemsSnapshot = async orderId => JSON.stringify(
+  await db.prepare("SELECT product, variant, quantity FROM order_items WHERE order_id = ? ORDER BY id").all(orderId)
 );
 
 // The customer is answered after EVERY message. Nothing the seller still has to check (catalog, price,
@@ -639,29 +543,29 @@ const itemsSnapshot = orderId => JSON.stringify(
 async function autoReply(connection, threadId, text) {
   if (process.env.META_AUTO_REPLY === "0") return;
 
-  const fail = message => {
-    db.prepare("UPDATE meta_threads SET reply_error = ? WHERE id = ?").run(String(message).slice(0, 300), threadId);
+  const fail = async message => {
+    await db.prepare("UPDATE meta_threads SET reply_error = ? WHERE id = ?").run(String(message).slice(0, 300), threadId);
     emit(connection.user_id, { type: "thread_updated", thread_id: threadId });
     console.error(`Auto reply NOT sent on thread ${threadId}: ${message}`);
   };
 
-  const thread = db.prepare("SELECT * FROM meta_threads WHERE id = ?").get(threadId);
-  const current = db.prepare("SELECT status FROM meta_connections WHERE id = ?").get(connection.id);
+  const thread = await db.prepare("SELECT * FROM meta_threads WHERE id = ?").get(threadId);
+  const current = await db.prepare("SELECT status FROM meta_connections WHERE id = ?").get(connection.id);
 
   if (!thread) return;
-  if (current?.status !== "active") return fail("the connection must be reconnected in Settings");
+  if (current?.status !== "active") return await fail("the connection must be reconnected in Settings");
   if (Date.now() - thread.last_inbound_at >= MESSAGING_WINDOW_MS) {
-    return fail("more than 24 hours since the customer's last message (Meta rule)");
+    return await fail("more than 24 hours since the customer's last message (Meta rule)");
   }
 
   try {
     await sendText(connection, thread, text);
-    db.prepare("UPDATE meta_threads SET last_auto_reply = ?, reply_error = '' WHERE id = ?").run(text, thread.id);
+    await db.prepare("UPDATE meta_threads SET last_auto_reply = ?, reply_error = '' WHERE id = ?").run(text, thread.id);
     emit(connection.user_id, { type: "thread_updated", thread_id: thread.id });
     console.log(`Auto reply sent on thread ${thread.id}`);
   } catch (error) {
-    markNeedsReconnect(error, connection);
-    fail(`Meta refused the reply: ${error.message}${error.code ? ` (code ${error.code})` : ""}`);
+    await markNeedsReconnect(error, connection);
+    await fail(`Meta refused the reply: ${error.message}${error.code ? ` (code ${error.code})` : ""}`);
   }
 }
 
@@ -674,9 +578,9 @@ const FALLBACK = {
 };
 
 // Summary the customer must approve BEFORE the order is registered.
-function summaryText(orderId) {
-  const order = db.prepare("SELECT customer_name, phone, city, address FROM orders WHERE id = ?").get(orderId) || {};
-  const items = db.prepare(
+async function summaryText(orderId) {
+  const order = await db.prepare("SELECT customer_name, phone, city, address FROM orders WHERE id = ?").get(orderId) || {};
+  const items = await db.prepare(
     "SELECT product, variant, quantity, unit_price FROM order_items WHERE order_id = ? ORDER BY id"
   ).all(orderId);
 
@@ -732,16 +636,16 @@ function aiBlockers(result, isNewDraft) {
 }
 
 async function autoProcessThread(threadId) {
-  const thread = db.prepare("SELECT * FROM meta_threads WHERE id = ?").get(threadId);
+  const thread = await db.prepare("SELECT * FROM meta_threads WHERE id = ?").get(threadId);
   if (!thread) return;
 
-  const connection = db.prepare("SELECT * FROM meta_connections WHERE id = ?").get(thread.connection_id);
+  const connection = await db.prepare("SELECT * FROM meta_connections WHERE id = ?").get(thread.connection_id);
   if (!connection) return;
 
   // Only customer messages that are not already part of a finished order.
-  const rows = db.prepare(
+  const rows = (await db.prepare(
     "SELECT id, text FROM meta_messages WHERE thread_id = ? AND direction = 'in' AND id > ? ORDER BY id DESC LIMIT 10"
-  ).all(thread.id, thread.order_cutoff || 0).reverse();
+  ).all(thread.id, thread.order_cutoff || 0)).reverse();
 
   if (!rows.length) return;
 
@@ -749,7 +653,7 @@ async function autoProcessThread(threadId) {
   const lastId = rows[rows.length - 1].id;
   const uid = connection.user_id;
 
-  const products = db.prepare("SELECT id, name, price, aliases FROM products WHERE user_id = ? ORDER BY name").all(uid);
+  const products = await db.prepare("SELECT id, name, price, aliases FROM products WHERE user_id = ? ORDER BY name").all(uid);
 
   // This conversation has an open draft only if it says so AND the order is still a pending draft (checked again by the database).
   const isOpen = Boolean(thread.order_id) &&
@@ -769,13 +673,13 @@ async function autoProcessThread(threadId) {
     const newRows = rows.filter(row => row.id > (thread.analyzed_upto || 0));
     if (!newRows.length) return;
 
-    const orderRow = db.prepare("SELECT customer_name, phone, city, address FROM orders WHERE id = ?").get(thread.order_id);
-    const lines = db.prepare("SELECT product, quantity, color, size FROM order_items WHERE order_id = ? ORDER BY id").all(thread.order_id);
+    const orderRow = await db.prepare("SELECT customer_name, phone, city, address FROM orders WHERE id = ?").get(thread.order_id);
+    const lines = await db.prepare("SELECT product, quantity, color, size FROM order_items WHERE order_id = ? ORDER BY id").all(thread.order_id);
 
     const firstNew = newRows[0].id;
-    const history = db.prepare(
+    const history = (await db.prepare(
       "SELECT id, direction, text FROM meta_messages WHERE thread_id = ? AND id > ? ORDER BY id DESC LIMIT 14"
-    ).all(thread.id, thread.order_cutoff || 0).reverse();
+    ).all(thread.id, thread.order_cutoff || 0)).reverse();
 
     const transcript = [];
     let marked = false;
@@ -847,7 +751,7 @@ async function autoProcessThread(threadId) {
   if (!turnMode && (!items.length || intent === "question" || intent === "complaint")) {
     const finished = thread.auto_status === "order_created"; // keep the badge of the order just saved
 
-    db.prepare("UPDATE meta_threads SET auto_status = ?, auto_note = ?, analyzed_upto = ?, last_result = ? WHERE id = ?")
+    await db.prepare("UPDATE meta_threads SET auto_status = ?, auto_note = ?, analyzed_upto = ?, last_result = ? WHERE id = ?")
       .run(
         finished ? thread.auto_status : "not_order",
         finished ? thread.auto_note : "",
@@ -870,7 +774,7 @@ async function autoProcessThread(threadId) {
   // Everything is required from the customer: a Facebook / Instagram profile name does not replace their name.
   const fallbackName = "";
 
-  const out = autoOrderHandler(uid, {
+  const out = await autoOrderHandler(uid, {
     threadId: thread.id,
     openOrderId,
     fields: {
@@ -893,7 +797,7 @@ async function autoProcessThread(threadId) {
     requireApproval: process.env.META_AUTO_CONFIRM !== "0",
     message: text,
     source: SOURCE_NAME[connection.platform] || "manual",
-    replaceItems: Boolean(openOrderId) && itemsSnapshot(openOrderId) === thread.draft_items,
+    replaceItems: Boolean(openOrderId) && (await itemsSnapshot(openOrderId)) === thread.draft_items,
     fallbackName,
     canComplete: blockers.length === 0,
     requireAddress: process.env.META_AUTO_REQUIRE_ADDRESS !== "0",
@@ -903,7 +807,7 @@ async function autoProcessThread(threadId) {
   // The draft was deleted, or the seller confirmed / cancelled it: it is closed. What the customer
   // writes from now on starts from the first message that was not analysed yet (never from the old text).
   if (!out.ok && out.gone) {
-    db.prepare(
+    await db.prepare(
       "UPDATE meta_threads SET order_id = NULL, auto_status = '', auto_note = '', draft_items = '', order_cutoff = ? WHERE id = ?"
     ).run(thread.analyzed_upto || 0, thread.id);
 
@@ -911,7 +815,7 @@ async function autoProcessThread(threadId) {
   }
 
   if (!out.ok) {
-    db.prepare("UPDATE meta_threads SET auto_status = 'needs_review', auto_note = ?, analyzed_upto = ?, last_result = ? WHERE id = ?")
+    await db.prepare("UPDATE meta_threads SET auto_status = 'needs_review', auto_note = ?, analyzed_upto = ?, last_result = ? WHERE id = ?")
       .run(out.reason || "could not save", lastId, summary, thread.id);
     emit(uid, { type: "thread_updated", thread_id: thread.id });
     console.log(`Auto order: thread ${thread.id} -> needs_review (${out.reason})`);
@@ -953,11 +857,11 @@ async function autoProcessThread(threadId) {
   }
 
   if (turnMode) {
-    const current = db.prepare("SELECT product, variant, quantity FROM order_items WHERE order_id = ? ORDER BY id").all(orderId);
+    const current = await db.prepare("SELECT product, variant, quantity FROM order_items WHERE order_id = ? ORDER BY id").all(orderId);
     summary = JSON.stringify({ ...JSON.parse(summary), items: current.map(i => ({ product: i.product, quantity: i.quantity, variant: i.variant || "" })) });
   }
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE meta_threads
     SET auto_status = ?, auto_note = ?, order_id = ?, analyzed_upto = ?, last_result = ?,
         order_cutoff = ?, draft_items = ?, draft_fields = ?
@@ -965,8 +869,8 @@ async function autoProcessThread(threadId) {
   `).run(
     status, note, orderId, lastId, summary,
     out.complete ? lastId : thread.order_cutoff,   // a finished order closes: the next one starts after it
-    out.complete ? "" : itemsSnapshot(orderId),
-    out.complete ? "" : JSON.stringify(db.prepare("SELECT customer_name, phone, city, address FROM orders WHERE id = ?").get(orderId) || {}),
+    out.complete ? "" : await itemsSnapshot(orderId),
+    out.complete ? "" : JSON.stringify(await db.prepare("SELECT customer_name, phone, city, address FROM orders WHERE id = ?").get(orderId) || {}),
     thread.id
   );
 
@@ -979,12 +883,12 @@ async function autoProcessThread(threadId) {
   //   something still missing   -> ask for it (even if the seller also has something to check)
   //   complete but to be checked (catalog, price, duplicate, AI doubt) -> "received, we will call you"
   if (out.complete) {
-    await autoReply(connection, thread.id, confirmationText(orderId));
+    await autoReply(connection, thread.id, await confirmationText(orderId));
   } else if (clarify) {
     await autoReply(connection, thread.id, clarify);
   } else if (out.awaiting && !issues.length) {
     const answer = intent === "question" && chatOn ? `${chatAnswer(result, intent, false)}\n\n` : "";
-    await autoReply(connection, thread.id, refused ? WHAT_TO_CHANGE : `${answer}${summaryText(orderId)}`);
+    await autoReply(connection, thread.id, refused ? WHAT_TO_CHANGE : `${answer}${await summaryText(orderId)}`);
   } else if (missing.length) {
     const ask = askText(missing, out.variantAsks);
     await autoReply(connection, thread.id, intent === "question" && chatOn ? `${chatAnswer(result, intent, false)}\n\n${ask}` : ask);
@@ -993,14 +897,14 @@ async function autoProcessThread(threadId) {
   }
 }
 
-export function processWebhook(payload) {
+async function processWebhookNow(payload) {
   const platform = payload?.object === "instagram" ? "instagram" : payload?.object === "page" ? "facebook" : null;
   if (!platform) return;
 
   console.log(`Meta webhook payload: object=${payload.object}, entries=${(payload.entry || []).map(e => e.id).join(",")}`);
 
   for (const entry of payload.entry || []) {
-    const connection = db.prepare(
+    const connection = await db.prepare(
       "SELECT * FROM meta_connections WHERE platform = ? AND account_id = ? AND status != 'removed'"
     ).get(platform, String(entry.id));
 
@@ -1025,7 +929,7 @@ export function processWebhook(payload) {
         || (message.attachments?.length ? `[${message.attachments[0].type || "attachment"}]` : "");
       if (!text) continue;
 
-      const thread = storeMessage(
+      const thread = await storeMessage(
         connection, customerId, message.mid, isEcho ? "out" : "in", text, Number(event.timestamp) || Date.now()
       );
 
@@ -1038,13 +942,27 @@ export function processWebhook(payload) {
   }
 }
 
+// Webhook payloads are handled strictly one after another, so messages are stored in the order Meta sent them
+// (processing two payloads at the same time could swap them in the conversation).
+let webhookQueue = Promise.resolve();
+
+export function processWebhook(payload) {
+  webhookQueue = webhookQueue
+    .then(() => processWebhookNow(payload))
+    .catch(error => console.error("Meta webhook processing error:", error));
+  return webhookQueue;
+}
+
+// Resolves when every webhook received so far has been stored (used by the tests).
+export const webhooksIdle = () => webhookQueue;
+
 async function fetchCustomerName(connection, thread) {
   const fields = connection.platform === "instagram" ? "name,username" : "name";
   const profile = await graph(`/${thread.customer_id}`, { token: decrypt(connection.token_enc), params: { fields } });
   const name = profile.name || (profile.username ? `@${profile.username}` : "");
 
   if (name) {
-    db.prepare("UPDATE meta_threads SET customer_name = ? WHERE id = ?").run(name, thread.id);
+    await db.prepare("UPDATE meta_threads SET customer_name = ? WHERE id = ?").run(name, thread.id);
     emit(connection.user_id, { type: "thread_updated", thread_id: thread.id });
   }
 }
@@ -1057,18 +975,18 @@ export const metaRouter = express.Router();
 
 const replyLimiter = rateLimit({ windowMs: 60_000, max: 30, keyFn: req => `meta${req.user.id}` });
 
-metaRouter.get("/status", (req, res) => {
-  const rows = db.prepare("SELECT * FROM meta_connections WHERE user_id = ? ORDER BY id").all(req.user.id);
+metaRouter.get("/status", async (req, res) => {
+  const rows = await db.prepare("SELECT * FROM meta_connections WHERE user_id = ? ORDER BY id").all(req.user.id);
   res.json({ configured: isConfigured(), connections: rows.map(publicConnection) });
 });
 
-metaRouter.post("/connect", (req, res) => {
+metaRouter.post("/connect", async (req, res) => {
   if (!isConfigured()) return res.status(503).json({ error: "Meta is not configured on this server." });
 
   const c = cfg();
   const state = crypto.randomBytes(24).toString("base64url");
 
-  db.prepare("INSERT INTO meta_oauth_states (state, user_id, expires_at) VALUES (?, ?, ?)")
+  await db.prepare("INSERT INTO meta_oauth_states (state, user_id, expires_at) VALUES (?, ?, ?)")
     .run(state, req.user.id, Date.now() + 10 * 60_000);
 
   const url = new URL(`https://www.facebook.com/${c.version}/dialog/oauth`);
@@ -1091,13 +1009,13 @@ metaRouter.delete("/connections/:id", async (req, res) => {
   const id = parseId(req.params.id);
   if (!id) return res.status(400).json({ error: "Invalid ID" });
 
-  const connection = getConnection(id, req.user.id);
+  const connection = await getConnection(id, req.user.id);
   if (!connection) return res.status(404).json({ error: "Connection not found" });
 
-  db.prepare("DELETE FROM meta_connections WHERE id = ?").run(id);
+  await db.prepare("DELETE FROM meta_connections WHERE id = ?").run(id);
 
   // Stop webhooks for this Page once no connection (Facebook or Instagram) uses it any more.
-  const stillUsed = db.prepare("SELECT 1 FROM meta_connections WHERE page_id = ?").get(connection.page_id);
+  const stillUsed = await db.prepare("SELECT 1 FROM meta_connections WHERE page_id = ?").get(connection.page_id);
 
   if (!stillUsed) {
     try {
@@ -1110,11 +1028,11 @@ metaRouter.delete("/connections/:id", async (req, res) => {
   res.json({ ok: true });
 });
 
-metaRouter.get("/threads", (req, res) => {
+metaRouter.get("/threads", async (req, res) => {
   const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
   const connectionId = parseId(req.query.connection_id);
 
-  const rows = db.prepare(`
+  const rows = await db.prepare(`
     SELECT t.id, t.connection_id, c.platform, c.name AS account_name, t.customer_id, t.customer_name,
            t.last_message, t.last_message_at, t.last_inbound_at, t.unread,
            t.auto_status, t.auto_note, t.order_id, t.last_result, t.reply_error
@@ -1129,23 +1047,23 @@ metaRouter.get("/threads", (req, res) => {
   })));
 });
 
-function getThread(req) {
+async function getThread(req) {
   const id = parseId(req.params.id);
   if (!id) return null;
-  return db.prepare("SELECT * FROM meta_threads WHERE id = ? AND user_id = ?").get(id, req.user.id) || null;
+  return await db.prepare("SELECT * FROM meta_threads WHERE id = ? AND user_id = ?").get(id, req.user.id) || null;
 }
 
-metaRouter.get("/threads/:id/messages", (req, res) => {
-  const thread = getThread(req);
+metaRouter.get("/threads/:id/messages", async (req, res) => {
+  const thread = await getThread(req);
   if (!thread) return res.status(404).json({ error: "Conversation not found" });
 
-  db.prepare("UPDATE meta_threads SET unread = 0 WHERE id = ?").run(thread.id);
+  await db.prepare("UPDATE meta_threads SET unread = 0 WHERE id = ?").run(thread.id);
 
   // ?before=<message id> loads older messages; ?limit=1..200 (default 50).
   const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
   const before = parseId(req.query.before);
 
-  const rows = db.prepare(
+  const rows = await db.prepare(
     `SELECT id, direction, text, created_at FROM meta_messages
      WHERE thread_id = ? ${before ? "AND id < ?" : ""} ORDER BY id DESC LIMIT ?`
   ).all(...[thread.id, ...(before ? [before] : []), limit + 1]);
@@ -1166,7 +1084,7 @@ metaRouter.get("/threads/:id/messages", (req, res) => {
 const replySchema = z.object({ text: z.string().trim().min(1, "Message is empty").max(1000) });
 
 metaRouter.post("/threads/:id/reply", replyLimiter, async (req, res) => {
-  const thread = getThread(req);
+  const thread = await getThread(req);
   if (!thread) return res.status(404).json({ error: "Conversation not found" });
 
   const parsed = replySchema.safeParse(req.body || {});
@@ -1179,7 +1097,7 @@ metaRouter.post("/threads/:id/reply", replyLimiter, async (req, res) => {
     });
   }
 
-  const connection = getConnection(thread.connection_id, req.user.id);
+  const connection = await getConnection(thread.connection_id, req.user.id);
   if (!connection) return res.status(404).json({ error: "Connection not found" });
   if (connection.status !== "active") {
     return res.status(409).json({ error: "This account must be reconnected before you can reply." });
@@ -1190,7 +1108,7 @@ metaRouter.post("/threads/:id/reply", replyLimiter, async (req, res) => {
 
     return res.status(201).json({ ok: true, message_id: sent.message_id });
   } catch (error) {
-    markNeedsReconnect(error, connection);
+    await markNeedsReconnect(error, connection);
     console.error("Meta send error:", error.message);
     return res.status(502).json({ error: `Meta refused the message: ${error.message}` });
   }
@@ -1199,17 +1117,17 @@ metaRouter.post("/threads/:id/reply", replyLimiter, async (req, res) => {
 // Reuses your Groq pipeline: customer messages in -> suggested reply + order draft out.
 metaRouter.post("/threads/:id/suggest", rateLimit({ windowMs: 60_000, max: 20, keyFn: req => `metaai${req.user.id}` }),
   async (req, res) => {
-    const thread = getThread(req);
+    const thread = await getThread(req);
     if (!thread) return res.status(404).json({ error: "Conversation not found" });
 
-    const inbound = db.prepare(
+    const inbound = (await db.prepare(
       "SELECT text FROM meta_messages WHERE thread_id = ? AND direction = 'in' ORDER BY id DESC LIMIT 5"
-    ).all(thread.id).reverse().map(m => m.text);
+    ).all(thread.id)).reverse().map(m => m.text);
 
     if (!inbound.length) return res.status(400).json({ error: "No customer message to analyse yet." });
 
     try {
-      const products = db.prepare("SELECT id, name, price, aliases FROM products WHERE user_id = ? ORDER BY name")
+      const products = await db.prepare("SELECT id, name, price, aliases FROM products WHERE user_id = ? ORDER BY name")
         .all(req.user.id);
       const result = await analyzeMessage(inbound.join("\n").slice(-2000), { products });
 
@@ -1226,10 +1144,10 @@ metaRouter.post("/threads/:id/suggest", rateLimit({ windowMs: 60_000, max: 20, k
     }
   });
 
-metaRouter.delete("/threads/:id", (req, res) => {
-  const thread = getThread(req);
+metaRouter.delete("/threads/:id", async (req, res) => {
+  const thread = await getThread(req);
   if (!thread) return res.status(404).json({ error: "Conversation not found" });
 
-  db.prepare("DELETE FROM meta_threads WHERE id = ?").run(thread.id);
+  await db.prepare("DELETE FROM meta_threads WHERE id = ?").run(thread.id);
   res.json({ ok: true });
 });
