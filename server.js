@@ -59,6 +59,7 @@ app.use("/api/auth", authRouter);
 // Everything below needs a logged-in user. req.user.id is the owner of all data.
 app.use("/api", requireAuth);
 
+app.use("/api/admin", requireAdmin, adminRouter);
 // Connect Facebook / Instagram, read and answer customer messages.
 app.use("/api/meta", metaRouter);
 
