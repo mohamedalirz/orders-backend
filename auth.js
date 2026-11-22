@@ -12,6 +12,7 @@ import express from "express";
 import { z } from "zod";
 import { db, isUniqueViolation } from "./db.js";
 import { badRequest, rateLimit } from "./util.js";
+import { isAdminEmail } from "./admin.js";
 
 const scrypt = promisify(crypto.scrypt);
 
@@ -74,7 +75,8 @@ const publicUser = user => ({
   id: user.id,
   email: user.email,
   name: user.name,
-  store_name: user.store_name
+  store_name: user.store_name,
+  is_admin: isAdminEmail(user.email)
 });
 
 // --------------------------------------------------
@@ -86,6 +88,8 @@ async function createSession(userId, req) {
 
   await db.prepare("INSERT INTO sessions (user_id, token_hash, expires_at, user_agent) VALUES (?, ?, ?, ?)")
     .run(userId, sha256(token), Date.now() + SESSION_MS, String(req.get("user-agent") || "").slice(0, 200));
+
+  await db.prepare("UPDATE users SET last_login_at = to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?").run(userId);
 
   return token;
 }
