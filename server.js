@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import "dotenv/config";
 
-import { db } from "./db.js";
+import { db, isUniqueViolation } from "./db.js";
 import { authRouter, requireAuth } from "./auth.js";
 import { analyzeMessage } from "./ai.js";
 import { metaPublicRouter, metaRouter, setAutoOrderHandler } from "./meta.js";
@@ -127,12 +127,6 @@ const productSchema = z.object({
   sizes: z.string().trim().max(200).optional()
 });
 
-for (const column of ["colors", "sizes"]) {
-  if (!db.prepare("PRAGMA table_info(products)").all().some(c => c.name === column)) {
-    db.exec(`ALTER TABLE products ADD COLUMN ${column} TEXT NOT NULL DEFAULT ''`);
-  }
-}
-
 // Older clients may send one product as flat fields.
 function withLegacyItems(body) {
   if (!body || Array.isArray(body.items) || !body.product) return body;
@@ -175,16 +169,20 @@ function summarizeItems(items) {
   };
 }
 
+// "N minutes ago" as the same text format the created_at columns use (UTC, YYYY-MM-DD HH:MM:SS).
+const MINUTES_AGO = minutes =>
+  `to_char((now() at time zone 'utc') - interval '${Number(minutes)} minutes', 'YYYY-MM-DD HH24:MI:SS')`;
+
 const riskLevel = failed => (failed >= 2 ? "high" : failed === 1 ? "medium" : "low");
 
-function enrichMany(rows, uid) {
+async function enrichMany(rows, uid) {
   if (!rows.length) return [];
 
   const ids = rows.map(row => row.id);
   const marks = ids.map(() => "?").join(",");
 
   const itemsByOrder = new Map();
-  for (const item of db.prepare(
+  for (const item of await db.prepare(
     `SELECT * FROM order_items WHERE order_id IN (${marks}) ORDER BY id ASC`
   ).all(...ids)) {
     if (!itemsByOrder.has(item.order_id)) itemsByOrder.set(item.order_id, []);
@@ -193,10 +191,10 @@ function enrichMany(rows, uid) {
 
   // Risk only counts THIS user's orders: other sellers' data is never mixed in.
   const failedByPhone = new Map(
-    db.prepare(`
+    (await db.prepare(`
       SELECT phone, COUNT(*) AS n FROM orders
       WHERE user_id = ? AND status IN ('returned', 'cancelled') GROUP BY phone
-    `).all(uid).map(row => [row.phone, row.n])
+    `).all(uid)).map(row => [row.phone, row.n])
   );
 
   return rows.map(row => {
@@ -209,9 +207,9 @@ function enrichMany(rows, uid) {
   });
 }
 
-function getOrder(id, uid) {
-  const row = db.prepare("SELECT * FROM orders WHERE id = ? AND user_id = ?").get(id, uid);
-  return row ? enrichMany([row], uid)[0] : null;
+async function getOrder(id, uid) {
+  const row = await db.prepare("SELECT * FROM orders WHERE id = ? AND user_id = ?").get(id, uid);
+  return row ? (await enrichMany([row], uid))[0] : null;
 }
 
 const insertOrderStatement = db.prepare(`
@@ -226,8 +224,8 @@ const insertItemStatement = db.prepare(`
   VALUES (@order_id, @product, @variant, @color, @size, @quantity, @unit_price)
 `);
 
-const createOrderTransaction = db.transaction((uid, data, items) => {
-  const result = insertOrderStatement.run({
+const createOrderTransaction = db.transaction(async (uid, data, items) => {
+  const result = await insertOrderStatement.run({
     user_id: uid,
     customer_name: data.customer_name,
     phone: data.phone,
@@ -243,20 +241,20 @@ const createOrderTransaction = db.transaction((uid, data, items) => {
 
   const orderId = Number(result.lastInsertRowid);
 
-  for (const item of items) insertItemStatement.run({ order_id: orderId, ...item });
+  for (const item of items) await insertItemStatement.run({ order_id: orderId, ...item });
 
   return orderId;
 });
 
 // Same phone + same products + same quantity within 15 minutes = probably a double click.
-function findDuplicate(uid, phone, items) {
+async function findDuplicate(uid, phone, items) {
   const summary = summarizeItems(items);
 
-  return db.prepare(`
+  return await db.prepare(`
     SELECT id FROM orders
     WHERE user_id = ? AND phone = ? AND product = ? AND quantity = ?
       AND status != 'cancelled'
-      AND created_at >= datetime('now', '-15 minutes')
+      AND created_at >= ${MINUTES_AGO(15)}
     ORDER BY id DESC LIMIT 1
   `).get(uid, phone, summary.product, summary.quantity);
 }
@@ -284,7 +282,7 @@ const splitOptions = value => String(value || "").split(/[,;\n،|]+/).map(option
 
 // Color / size are only asked for products that HAVE colors / sizes in the catalog (Products page).
 // Each ask carries the available choices so the reply can list them.
-function orderMissing(uid, row, orderItems, { requireAddress = true, requireVariant = true, fallbackName = "" } = {}) {
+async function orderMissing(uid, row, orderItems, { requireAddress = true, requireVariant = true, fallbackName = "" } = {}) {
   const missing = [];
 
   if (!(row.customer_name || fallbackName)) missing.push("customer_name");
@@ -297,7 +295,7 @@ function orderMissing(uid, row, orderItems, { requireAddress = true, requireVari
 
   if (requireVariant) {
     for (const item of orderItems) {
-      const catalog = db.prepare("SELECT colors, sizes FROM products WHERE user_id = ? AND name = ? COLLATE NOCASE")
+      const catalog = await db.prepare("SELECT colors, sizes FROM products WHERE user_id = ? AND name = ?")
         .get(uid, item.product);
 
       const colors = splitOptions(catalog?.colors);
@@ -334,11 +332,11 @@ function orderMissing(uid, row, orderItems, { requireAddress = true, requireVari
 // Applies what the AI understood from the customer's message to the item lines of a draft:
 //   update = change a line (size, color, quantity, product), add = a new line, remove = delete a line.
 // Lines are numbered from 1 in the order they were created (same numbering the AI was shown).
-function applyLineChanges(orderId, changes) {
+async function applyLineChanges(orderId, changes) {
   let applied = 0;
 
   for (const change of changes.slice(0, 10)) {
-    const lines = db.prepare("SELECT * FROM order_items WHERE order_id = ? ORDER BY id").all(orderId);
+    const lines = await db.prepare("SELECT * FROM order_items WHERE order_id = ? ORDER BY id").all(orderId);
 
     if (change.action === "add") {
       const parsed = itemSchema.safeParse({
@@ -346,7 +344,7 @@ function applyLineChanges(orderId, changes) {
         color: change.color || "", size: change.size || "", unit_price: change.unit_price || 0
       });
       if (!parsed.success) continue;
-      insertItemStatement.run({ order_id: orderId, ...prepareItems([parsed.data])[0] });
+      await insertItemStatement.run({ order_id: orderId, ...prepareItems([parsed.data])[0] });
       applied++;
       continue;
     }
@@ -355,7 +353,7 @@ function applyLineChanges(orderId, changes) {
     if (!line) continue;
 
     if (change.action === "remove") {
-      if (lines.length > 1) { db.prepare("DELETE FROM order_items WHERE id = ?").run(line.id); applied++; }
+      if (lines.length > 1) { await db.prepare("DELETE FROM order_items WHERE id = ?").run(line.id); applied++; }
       continue;
     }
 
@@ -369,7 +367,7 @@ function applyLineChanges(orderId, changes) {
     };
     const variant = [next.color, next.size].filter(Boolean).join(" / ");
 
-    db.prepare(`
+    await db.prepare(`
       UPDATE order_items SET product = ?, quantity = ?, color = ?, size = ?, variant = ?, unit_price = ?
       WHERE id = ? AND order_id = ?
     `).run(next.product, next.quantity, next.color, next.size, variant, next.unit_price, line.id, orderId);
@@ -377,8 +375,8 @@ function applyLineChanges(orderId, changes) {
   }
 
   if (applied) {
-    const all = db.prepare("SELECT product, variant, quantity, unit_price FROM order_items WHERE order_id = ? ORDER BY id").all(orderId);
-    db.prepare("UPDATE orders SET product = @product, variant = @variant, quantity = @quantity, unit_price = @unit_price WHERE id = @id")
+    const all = await db.prepare("SELECT product, variant, quantity, unit_price FROM order_items WHERE order_id = ? ORDER BY id").all(orderId);
+    await db.prepare("UPDATE orders SET product = @product, variant = @variant, quantity = @quantity, unit_price = @unit_price WHERE id = @id")
       .run({ ...summarizeItems(all), id: orderId });
   }
 
@@ -390,9 +388,9 @@ const pickValid = (schema, value) => {
   return parsed.success ? parsed.data : "";
 };
 
-setAutoOrderHandler((uid, ctx) => {
+setAutoOrderHandler(async (uid, ctx) => {
   try {
-    return db.transaction(() => {
+    return await db.transaction(async () => {
       const tid = ctx.threadId;
       let row = null;
       let created = false;
@@ -400,7 +398,7 @@ setAutoOrderHandler((uid, ctx) => {
       let fieldsChanged = false;
 
       if (ctx.openOrderId) {
-        row = db.prepare(`
+        row = await db.prepare(`
           SELECT * FROM orders
           WHERE id = ? AND user_id = ? AND meta_thread_id = ? AND draft = 1 AND status = 'pending'
         `).get(ctx.openOrderId, uid, tid);
@@ -423,7 +421,7 @@ setAutoOrderHandler((uid, ctx) => {
       if (!row) {
         if (!items.length) return { ok: false, reason: "no valid product detected" };
 
-        const id = createOrderTransaction(uid, {
+        const id = await createOrderTransaction(uid, {
           ...clean,
           status: "pending",
           delivery_status: "not_sent",
@@ -432,9 +430,9 @@ setAutoOrderHandler((uid, ctx) => {
           message: String(ctx.message || "").slice(0, 4000)
         }, items);
 
-        db.prepare("UPDATE orders SET meta_thread_id = ?, draft = 1 WHERE id = ? AND user_id = ?").run(tid, id, uid);
+        await db.prepare("UPDATE orders SET meta_thread_id = ?, draft = 1 WHERE id = ? AND user_id = ?").run(tid, id, uid);
 
-        row = db.prepare("SELECT * FROM orders WHERE id = ? AND user_id = ?").get(id, uid);
+        row = await db.prepare("SELECT * FROM orders WHERE id = ? AND user_id = ?").get(id, uid);
         created = true;
       } else {
         // ---- later messages: fill what is still empty, nothing else
@@ -448,39 +446,39 @@ setAutoOrderHandler((uid, ctx) => {
         }
 
         // keys come from the fixed list above, never from the customer, so this is safe.
-        db.prepare(`
+        await db.prepare(`
           UPDATE orders SET ${Object.keys(set).map(k => `${k} = @${k}`).join(", ")}
           WHERE id = @id AND user_id = @uid AND meta_thread_id = @tid AND draft = 1
         `).run({ ...set, id: row.id, uid, tid });
 
         // The AI's line operations (change a size, add a piece, remove a line) apply only while the seller has not edited the items.
         if (ctx.changes?.length && ctx.replaceItems) {
-          itemsChanged = applyLineChanges(row.id, ctx.changes) > 0;
+          itemsChanged = (await applyLineChanges(row.id, ctx.changes)) > 0;
         }
         fieldsChanged = Object.keys(set).some(key => key !== "message");
 
         // Items follow the customer only while the seller has not changed them.
         if (ctx.replaceItems && items.length) {
-          db.prepare(`
+          await db.prepare(`
             UPDATE orders SET product = @product, variant = @variant, quantity = @quantity, unit_price = @unit_price
             WHERE id = @id AND user_id = @uid AND meta_thread_id = @tid AND draft = 1
           `).run({ ...summarizeItems(items), id: row.id, uid, tid });
 
-          db.prepare("DELETE FROM order_items WHERE order_id = ?").run(row.id);
-          for (const item of items) insertItemStatement.run({ order_id: row.id, ...item });
+          await db.prepare("DELETE FROM order_items WHERE order_id = ?").run(row.id);
+          for (const item of items) await insertItemStatement.run({ order_id: row.id, ...item });
         }
 
-        row = db.prepare("SELECT * FROM orders WHERE id = ? AND user_id = ?").get(row.id, uid);
+        row = await db.prepare("SELECT * FROM orders WHERE id = ? AND user_id = ?").get(row.id, uid);
       }
 
       // ---- what is still missing, and is the order complete?
       const name = row.customer_name || ctx.fallbackName || "";
 
-      const orderItems = db.prepare(
+      const orderItems = await db.prepare(
         "SELECT product, variant, color, size, unit_price FROM order_items WHERE order_id = ?"
       ).all(row.id);
 
-      const { missing, variantAsks } = orderMissing(uid, row, orderItems, {
+      const { missing, variantAsks } = await orderMissing(uid, row, orderItems, {
         requireAddress: ctx.requireAddress,
         requireVariant: ctx.requireVariant,
         fallbackName: ctx.fallbackName
@@ -493,10 +491,10 @@ setAutoOrderHandler((uid, ctx) => {
       let duplicate_id = null;
 
       if (!missing.length && ctx.canComplete && !unpriced) {
-        const duplicate = db.prepare(`
+        const duplicate = await db.prepare(`
           SELECT id FROM orders
           WHERE user_id = ? AND id != ? AND phone = ? AND product = ? AND quantity = ?
-            AND status != 'cancelled' AND created_at >= datetime('now', '-15 minutes')
+            AND status != 'cancelled' AND created_at >= ${MINUTES_AGO(15)}
           ORDER BY id DESC LIMIT 1
         `).get(uid, row.id, row.phone, row.product, row.quantity);
 
@@ -505,10 +503,10 @@ setAutoOrderHandler((uid, ctx) => {
         } else if (ctx.requireApproval && !(ctx.approved && !itemsChanged && !fieldsChanged)) {
           awaiting = true; // everything is there: the customer must approve the summary first
           if (name && name !== row.customer_name) {
-            db.prepare("UPDATE orders SET customer_name = ? WHERE id = ? AND user_id = ? AND draft = 1").run(name, row.id, uid);
+            await db.prepare("UPDATE orders SET customer_name = ? WHERE id = ? AND user_id = ? AND draft = 1").run(name, row.id, uid);
           }
         } else {
-          db.prepare(`
+          await db.prepare(`
             UPDATE orders SET draft = 0, customer_name = ?
             WHERE id = ? AND user_id = ? AND meta_thread_id = ? AND draft = 1
           `).run(name, row.id, uid, tid);
@@ -528,7 +526,7 @@ setAutoOrderHandler((uid, ctx) => {
 // ORDERS
 // --------------------------------------------------
 
-app.get("/api/orders", (req, res) => {
+app.get("/api/orders", async (req, res) => {
   const uid = req.user.id;
   const q = String(req.query.q || "").trim().toLowerCase().slice(0, 100);
   const status = String(req.query.status || "");
@@ -554,17 +552,17 @@ app.get("/api/orders", (req, res) => {
     params.push(like, like, like, like);
   }
 
-  const rows = db.prepare(`
+  const rows = await db.prepare(`
     SELECT o.* FROM orders o
     WHERE ${where.join(" AND ")}
-    ORDER BY datetime(o.created_at) DESC, o.id DESC
+    ORDER BY o.created_at DESC, o.id DESC
     LIMIT ?
   `).all(...params, limit);
 
-  res.json(enrichMany(rows, uid));
+  res.json(await enrichMany(rows, uid));
 });
 
-app.post("/api/orders", (req, res) => {
+app.post("/api/orders", async (req, res) => {
   const uid = req.user.id;
   const parsed = createSchema.safeParse(withLegacyItems(req.body));
 
@@ -574,7 +572,7 @@ app.post("/api/orders", (req, res) => {
   const items = prepareItems(data.items);
 
   const forced = req.query.force === "1" || req.body?.force === true;
-  const duplicate = forced ? null : findDuplicate(uid, data.phone, items);
+  const duplicate = forced ? null : await findDuplicate(uid, data.phone, items);
 
   if (duplicate) {
     return res.status(409).json({
@@ -584,20 +582,20 @@ app.post("/api/orders", (req, res) => {
   }
 
   try {
-    return res.status(201).json(getOrder(createOrderTransaction(uid, data, items), uid));
+    return res.status(201).json(await getOrder(await createOrderTransaction(uid, data, items), uid));
   } catch (error) {
     console.error("Create order error:", error);
     return res.status(500).json({ error: "Could not create order" });
   }
 });
 
-app.patch("/api/orders/:id", (req, res) => {
+app.patch("/api/orders/:id", async (req, res) => {
   const uid = req.user.id;
   const id = parseId(req.params.id);
 
   if (!id) return res.status(400).json({ error: "Invalid order ID" });
 
-  if (!db.prepare("SELECT 1 FROM orders WHERE id = ? AND user_id = ?").get(id, uid)) {
+  if (!(await db.prepare("SELECT 1 FROM orders WHERE id = ? AND user_id = ?").get(id, uid))) {
     return res.status(404).json({ error: "Order not found" });
   }
 
@@ -616,14 +614,14 @@ app.patch("/api/orders/:id", (req, res) => {
   const items = rawItems ? prepareItems(rawItems) : null;
 
   // An order still waiting for the customer cannot be confirmed (or sent) until it is complete.
-  const current = db.prepare("SELECT * FROM orders WHERE id = ? AND user_id = ?").get(id, uid);
+  const current = await db.prepare("SELECT * FROM orders WHERE id = ? AND user_id = ?").get(id, uid);
 
   if (current.draft === 1 && data.status && data.status !== "pending" && data.status !== "cancelled") {
     const shown = { ...current };
     for (const key of ["customer_name", "phone", "city", "address"]) if (data[key] !== undefined) shown[key] = data[key];
 
-    const rows = items || db.prepare("SELECT product, variant, color, size FROM order_items WHERE order_id = ?").all(id);
-    const { missing, variantAsks } = orderMissing(uid, shown, rows, autoRequirements());
+    const rows = items || await db.prepare("SELECT product, variant, color, size FROM order_items WHERE order_id = ?").all(id);
+    const { missing, variantAsks } = await orderMissing(uid, shown, rows, autoRequirements());
 
     if (missing.length) {
       const waiting = [
@@ -640,41 +638,41 @@ app.patch("/api/orders/:id", (req, res) => {
   }
 
   try {
-    db.transaction(() => {
+    await db.transaction(async () => {
       if (items) {
-        db.prepare(`
+        await db.prepare(`
           UPDATE orders
           SET product = @product, variant = @variant, quantity = @quantity, unit_price = @unit_price
           WHERE id = @id AND user_id = @uid
         `).run({ ...summarizeItems(items), id, uid });
 
-        db.prepare("DELETE FROM order_items WHERE order_id = ?").run(id);
+        await db.prepare("DELETE FROM order_items WHERE order_id = ?").run(id);
 
-        for (const item of items) insertItemStatement.run({ order_id: id, ...item });
+        for (const item of items) await insertItemStatement.run({ order_id: id, ...item });
       }
 
       const keys = Object.keys(data);
 
       if (keys.length) {
         // keys come from the Zod schema above, never from the request, so this is safe.
-        db.prepare(`UPDATE orders SET ${keys.map(k => `${k} = @${k}`).join(", ")} WHERE id = @id AND user_id = @uid`)
+        await db.prepare(`UPDATE orders SET ${keys.map(k => `${k} = @${k}`).join(", ")} WHERE id = @id AND user_id = @uid`)
           .run({ ...data, id, uid });
       }
     })();
 
-    return res.json(getOrder(id, uid));
+    return res.json(await getOrder(id, uid));
   } catch (error) {
     console.error("Update order error:", error);
     return res.status(500).json({ error: "Could not update order" });
   }
 });
 
-app.delete("/api/orders/:id", (req, res) => {
+app.delete("/api/orders/:id", async (req, res) => {
   const id = parseId(req.params.id);
 
   if (!id) return res.status(400).json({ error: "Invalid order ID" });
 
-  const result = db.prepare("DELETE FROM orders WHERE id = ? AND user_id = ?").run(id, req.user.id);
+  const result = await db.prepare("DELETE FROM orders WHERE id = ? AND user_id = ?").run(id, req.user.id);
 
   if (!result.changes) return res.status(404).json({ error: "Order not found" });
 
@@ -685,27 +683,27 @@ app.delete("/api/orders/:id", (req, res) => {
 // PRODUCTS (your catalog: names, prices, the words customers use)
 // --------------------------------------------------
 
-const isUniqueError = error => String(error.code).startsWith("SQLITE_CONSTRAINT");
+const isUniqueError = isUniqueViolation;
 
-app.get("/api/products", (req, res) => {
+app.get("/api/products", async (req, res) => {
   res.json(
-    db.prepare("SELECT id, name, price, aliases, colors, sizes, created_at FROM products WHERE user_id = ? ORDER BY name COLLATE NOCASE")
+    await db.prepare("SELECT id, name, price, aliases, colors, sizes, created_at FROM products WHERE user_id = ? ORDER BY name")
       .all(req.user.id)
   );
 });
 
-app.post("/api/products", (req, res) => {
+app.post("/api/products", async (req, res) => {
   const uid = req.user.id;
   const parsed = productSchema.safeParse(req.body || {});
 
   if (!parsed.success) return badRequest(res, parsed.error, "Invalid product");
 
   try {
-    const result = db.prepare("INSERT INTO products (user_id, name, price, aliases, colors, sizes) VALUES (?, ?, ?, ?, ?, ?)")
+    const result = await db.prepare("INSERT INTO products (user_id, name, price, aliases, colors, sizes) VALUES (?, ?, ?, ?, ?, ?)")
       .run(uid, parsed.data.name, parsed.data.price, parsed.data.aliases, parsed.data.colors ?? "", parsed.data.sizes ?? "");
 
     return res.status(201).json(
-      db.prepare("SELECT id, name, price, aliases, colors, sizes, created_at FROM products WHERE id = ?").get(result.lastInsertRowid)
+      await db.prepare("SELECT id, name, price, aliases, colors, sizes, created_at FROM products WHERE id = ?").get(result.lastInsertRowid)
     );
   } catch (error) {
     if (isUniqueError(error)) return res.status(409).json({ error: "A product with this name already exists." });
@@ -714,13 +712,13 @@ app.post("/api/products", (req, res) => {
   }
 });
 
-app.patch("/api/products/:id", (req, res) => {
+app.patch("/api/products/:id", async (req, res) => {
   const uid = req.user.id;
   const id = parseId(req.params.id);
 
   if (!id) return res.status(400).json({ error: "Invalid product ID" });
 
-  if (!db.prepare("SELECT 1 FROM products WHERE id = ? AND user_id = ?").get(id, uid)) {
+  if (!(await db.prepare("SELECT 1 FROM products WHERE id = ? AND user_id = ?").get(id, uid))) {
     return res.status(404).json({ error: "Product not found" });
   }
 
@@ -729,11 +727,11 @@ app.patch("/api/products/:id", (req, res) => {
   if (!parsed.success) return badRequest(res, parsed.error, "Invalid product");
 
   try {
-    db.prepare("UPDATE products SET name = ?, price = ?, aliases = ?, colors = COALESCE(?, colors), sizes = COALESCE(?, sizes) WHERE id = ? AND user_id = ?")
+    await db.prepare("UPDATE products SET name = ?, price = ?, aliases = ?, colors = COALESCE(?::text, colors), sizes = COALESCE(?::text, sizes) WHERE id = ? AND user_id = ?")
       .run(parsed.data.name, parsed.data.price, parsed.data.aliases, parsed.data.colors ?? null, parsed.data.sizes ?? null, id, uid);
 
     return res.json(
-      db.prepare("SELECT id, name, price, aliases, colors, sizes, created_at FROM products WHERE id = ?").get(id)
+      await db.prepare("SELECT id, name, price, aliases, colors, sizes, created_at FROM products WHERE id = ?").get(id)
     );
   } catch (error) {
     if (isUniqueError(error)) return res.status(409).json({ error: "A product with this name already exists." });
@@ -742,12 +740,12 @@ app.patch("/api/products/:id", (req, res) => {
   }
 });
 
-app.delete("/api/products/:id", (req, res) => {
+app.delete("/api/products/:id", async (req, res) => {
   const id = parseId(req.params.id);
 
   if (!id) return res.status(400).json({ error: "Invalid product ID" });
 
-  const result = db.prepare("DELETE FROM products WHERE id = ? AND user_id = ?").run(id, req.user.id);
+  const result = await db.prepare("DELETE FROM products WHERE id = ? AND user_id = ?").run(id, req.user.id);
 
   if (!result.changes) return res.status(404).json({ error: "Product not found" });
 
@@ -758,26 +756,26 @@ app.delete("/api/products/:id", (req, res) => {
 // STATISTICS
 // --------------------------------------------------
 
-app.get("/api/stats", (req, res) => {
+app.get("/api/stats", async (req, res) => {
   const uid = req.user.id;
 
-  const count = status =>
-    db.prepare("SELECT COUNT(*) n FROM orders WHERE user_id = ? AND status = ?").get(uid, status).n;
+  const count = async status =>
+    (await db.prepare("SELECT COUNT(*) n FROM orders WHERE user_id = ? AND status = ?").get(uid, status)).n;
 
-  const sumItems = condition => db.prepare(`
+  const sumItems = async condition => (await db.prepare(`
     SELECT COALESCE(SUM(oi.quantity * oi.unit_price), 0) n
     FROM orders o JOIN order_items oi ON oi.order_id = o.id
     WHERE o.user_id = ? AND ${condition}
-  `).get(uid).n;
+  `).get(uid)).n;
 
   res.json({
-    total: db.prepare("SELECT COUNT(*) n FROM orders WHERE user_id = ?").get(uid).n,
-    pending: count("pending"),
-    confirmed: count("confirmed"),
-    delivered: count("delivered"),
-    returned: count("returned"),
-    revenue: sumItems("o.status = 'delivered'"),
-    codPending: sumItems("o.cod_status = 'pending'")
+    total: (await db.prepare("SELECT COUNT(*) n FROM orders WHERE user_id = ?").get(uid)).n,
+    pending: await count("pending"),
+    confirmed: await count("confirmed"),
+    delivered: await count("delivered"),
+    returned: await count("returned"),
+    revenue: await sumItems("o.status = 'delivered'"),
+    codPending: await sumItems("o.cod_status = 'pending'")
   });
 });
 
@@ -835,7 +833,7 @@ app.post("/api/extract", extractLimiter, async (req, res) => {
   }
 
   try {
-    const products = db.prepare("SELECT id, name, price, aliases FROM products WHERE user_id = ? ORDER BY name").all(uid);
+    const products = await db.prepare("SELECT id, name, price, aliases FROM products WHERE user_id = ? ORDER BY name").all(uid);
     const result = await analyzeMessage(message, { products });
 
     const items = result.items || [];
@@ -874,11 +872,11 @@ app.post("/api/extract", extractLimiter, async (req, res) => {
     };
 
     // Saved, so the message and the AI's answer are still there after a refresh or on another device.
-    const saved = db.prepare("INSERT INTO extractions (user_id, message, result) VALUES (?, ?, ?)")
+    const saved = await db.prepare("INSERT INTO extractions (user_id, message, result) VALUES (?, ?, ?)")
       .run(uid, message, JSON.stringify(response));
 
     // Keep each account's history to the latest 200 messages.
-    db.prepare(`
+    await db.prepare(`
       DELETE FROM extractions WHERE user_id = ? AND id NOT IN
         (SELECT id FROM extractions WHERE user_id = ? ORDER BY id DESC LIMIT 200)
     `).run(uid, uid);
@@ -890,10 +888,10 @@ app.post("/api/extract", extractLimiter, async (req, res) => {
   }
 });
 
-app.get("/api/extractions", (req, res) => {
+app.get("/api/extractions", async (req, res) => {
   const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
 
-  const rows = db.prepare(
+  const rows = await db.prepare(
     "SELECT id, message, result, created_at FROM extractions WHERE user_id = ? ORDER BY id DESC LIMIT ?"
   ).all(req.user.id, limit);
 
@@ -904,12 +902,12 @@ app.get("/api/extractions", (req, res) => {
   }));
 });
 
-app.delete("/api/extractions/:id", (req, res) => {
+app.delete("/api/extractions/:id", async (req, res) => {
   const id = parseId(req.params.id);
 
   if (!id) return res.status(400).json({ error: "Invalid ID" });
 
-  const result = db.prepare("DELETE FROM extractions WHERE id = ? AND user_id = ?").run(id, req.user.id);
+  const result = await db.prepare("DELETE FROM extractions WHERE id = ? AND user_id = ?").run(id, req.user.id);
 
   if (!result.changes) return res.status(404).json({ error: "Not found" });
 
