@@ -3,15 +3,14 @@
 // - Passwords are never stored: only a salted scrypt hash (built into Node).
 // - A login creates a random token. The browser keeps the token; the database keeps only
 //   its SHA-256 hash and an expiry date. Logout deletes the row, so a stolen token stops working.
-// - The first account on a new server is always allowed and takes over any orders/products
-//   that already exist (data saved before accounts existed). After that, sign-ups are closed
-//   unless ALLOW_SIGNUP=1 is set in .env.
+// - Anyone can create an account (each seller sees only their own data).
+//   To close sign-ups, set ALLOW_SIGNUP=0 in the environment.
 
 import crypto from "node:crypto";
 import { promisify } from "node:util";
 import express from "express";
 import { z } from "zod";
-import { db } from "./db.js";
+import { db, isUniqueViolation } from "./db.js";
 import { badRequest, rateLimit } from "./util.js";
 
 const scrypt = promisify(crypto.scrypt);
@@ -82,10 +81,10 @@ const publicUser = user => ({
 // SESSIONS
 // --------------------------------------------------
 
-function createSession(userId, req) {
+async function createSession(userId, req) {
   const token = crypto.randomBytes(32).toString("base64url");
 
-  db.prepare("INSERT INTO sessions (user_id, token_hash, expires_at, user_agent) VALUES (?, ?, ?, ?)")
+  await db.prepare("INSERT INTO sessions (user_id, token_hash, expires_at, user_agent) VALUES (?, ?, ?, ?)")
     .run(userId, sha256(token), Date.now() + SESSION_MS, String(req.get("user-agent") || "").slice(0, 200));
 
   return token;
@@ -97,10 +96,10 @@ const tokenFrom = req => {
 };
 
 // Put this in front of every route that needs a logged-in user. It sets req.user and req.sessionId.
-export function requireAuth(req, res, next) {
+export async function requireAuth(req, res, next) {
   const token = tokenFrom(req);
 
-  const row = token && db.prepare(`
+  const row = token && await db.prepare(`
     SELECT s.id AS session_id, u.id, u.email, u.name, u.store_name
     FROM sessions s JOIN users u ON u.id = s.user_id
     WHERE s.token_hash = ? AND s.expires_at > ?
@@ -114,7 +113,7 @@ export function requireAuth(req, res, next) {
 }
 
 // Expired sessions are removed once an hour.
-setInterval(() => db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(Date.now()), 3600_000).unref();
+setInterval(() => db.prepare("DELETE FROM sessions WHERE expires_at < ?").run(Date.now()).catch(() => {}), 3600_000).unref();
 
 // --------------------------------------------------
 // FAILED-LOGIN COUNTER (in memory)
@@ -147,13 +146,12 @@ function addFailure(key) {
 
 export const authRouter = express.Router();
 
-const hasUsers = () => db.prepare("SELECT 1 FROM users LIMIT 1").get() !== undefined;
-const signupOpen = () => process.env.ALLOW_SIGNUP === "1";
+const hasUsers = async () => (await db.prepare("SELECT 1 FROM users LIMIT 1").get()) !== undefined;
+const signupOpen = () => process.env.ALLOW_SIGNUP !== "0";
 
 // The login page asks this to know which form to show.
-authRouter.get("/status", (_, res) => {
-  const users = hasUsers();
-  res.json({ hasUsers: users, signupOpen: !users || signupOpen() });
+authRouter.get("/status", async (_, res) => {
+  res.json({ hasUsers: await hasUsers(), signupOpen: signupOpen() });
 });
 
 authRouter.post(
@@ -163,7 +161,7 @@ authRouter.post(
     const parsed = registerSchema.safeParse(req.body || {});
     if (!parsed.success) return badRequest(res, parsed.error);
 
-    if (hasUsers() && !signupOpen()) {
+    if (!signupOpen()) {
       return res.status(403).json({ error: "Sign-ups are closed on this server." });
     }
 
@@ -171,32 +169,16 @@ authRouter.post(
     const passwordHash = await hashPassword(data.password);
 
     try {
-      const userId = db.transaction(() => {
-        // Checked again inside the transaction, in case two sign-ups arrive together.
-        const first = !hasUsers();
-        if (!first && !signupOpen()) throw Object.assign(new Error("closed"), { code: "CLOSED" });
+      const result = await db
+        .prepare("INSERT INTO users (email, name, store_name, password_hash) VALUES (?, ?, ?, ?)")
+        .run(data.email, data.name, data.store_name, passwordHash);
 
-        const result = db
-          .prepare("INSERT INTO users (email, name, store_name, password_hash) VALUES (?, ?, ?, ?)")
-          .run(data.email, data.name, data.store_name, passwordHash);
+      const userId = Number(result.lastInsertRowid);
+      const user = await db.prepare("SELECT id, email, name, store_name FROM users WHERE id = ?").get(userId);
 
-        const id = Number(result.lastInsertRowid);
-
-        // The first account takes over everything saved before accounts existed.
-        if (first) {
-          db.prepare("UPDATE orders SET user_id = ? WHERE user_id IS NULL").run(id);
-          db.prepare("UPDATE products SET user_id = ? WHERE user_id IS NULL").run(id);
-        }
-
-        return id;
-      })();
-
-      const user = db.prepare("SELECT id, email, name, store_name FROM users WHERE id = ?").get(userId);
-
-      res.status(201).json({ token: createSession(userId, req), user: publicUser(user) });
+      res.status(201).json({ token: await createSession(userId, req), user: publicUser(user) });
     } catch (error) {
-      if (error.code === "CLOSED") return res.status(403).json({ error: "Sign-ups are closed on this server." });
-      if (String(error.code).startsWith("SQLITE_CONSTRAINT")) {
+      if (isUniqueViolation(error)) {
         return res.status(409).json({ error: "An account with this email already exists." });
       }
       throw error;
@@ -216,7 +198,7 @@ authRouter.post("/login", async (req, res) => {
     return res.status(429).json({ error: "Too many failed attempts. Try again in 15 minutes." });
   }
 
-  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(address);
+  const user = await db.prepare("SELECT * FROM users WHERE email = ?").get(address);
   const ok = await verifyPassword(password, user ? user.password_hash : await getDummyHash());
 
   if (!user || !ok) {
@@ -227,11 +209,11 @@ authRouter.post("/login", async (req, res) => {
 
   failures.delete(accountKey);
 
-  res.json({ token: createSession(user.id, req), user: publicUser(user) });
+  res.json({ token: await createSession(user.id, req), user: publicUser(user) });
 });
 
-authRouter.post("/logout", requireAuth, (req, res) => {
-  db.prepare("DELETE FROM sessions WHERE id = ?").run(req.sessionId);
+authRouter.post("/logout", requireAuth, async (req, res) => {
+  await db.prepare("DELETE FROM sessions WHERE id = ?").run(req.sessionId);
   res.json({ ok: true });
 });
 
@@ -239,16 +221,16 @@ authRouter.get("/me", requireAuth, (req, res) => {
   res.json({ user: req.user });
 });
 
-authRouter.patch("/me", requireAuth, (req, res) => {
+authRouter.patch("/me", requireAuth, async (req, res) => {
   const parsed = profileSchema.safeParse(req.body || {});
   if (!parsed.success) return badRequest(res, parsed.error);
 
   const { name: newName, store_name: newStore } = parsed.data;
 
-  db.prepare("UPDATE users SET name = COALESCE(?, name), store_name = COALESCE(?, store_name) WHERE id = ?")
+  await db.prepare("UPDATE users SET name = COALESCE(?::text, name), store_name = COALESCE(?::text, store_name) WHERE id = ?")
     .run(newName ?? null, newStore ?? null, req.user.id);
 
-  res.json({ user: publicUser(db.prepare("SELECT * FROM users WHERE id = ?").get(req.user.id)) });
+  res.json({ user: publicUser(await db.prepare("SELECT * FROM users WHERE id = ?").get(req.user.id)) });
 });
 
 authRouter.post("/password", requireAuth, async (req, res) => {
@@ -261,7 +243,7 @@ authRouter.post("/password", requireAuth, async (req, res) => {
     return res.status(429).json({ error: "Too many attempts. Try again in 15 minutes." });
   }
 
-  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(req.user.id);
+  const user = await db.prepare("SELECT * FROM users WHERE id = ?").get(req.user.id);
 
   if (!(await verifyPassword(parsed.data.current_password, user.password_hash))) {
     addFailure(key);
@@ -270,10 +252,10 @@ authRouter.post("/password", requireAuth, async (req, res) => {
 
   const hash = await hashPassword(parsed.data.new_password);
 
-  db.transaction(() => {
-    db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(hash, user.id);
+  await db.transaction(async () => {
+    await db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(hash, user.id);
     // Every other device must sign in again with the new password.
-    db.prepare("DELETE FROM sessions WHERE user_id = ? AND id != ?").run(user.id, req.sessionId);
+    await db.prepare("DELETE FROM sessions WHERE user_id = ? AND id != ?").run(user.id, req.sessionId);
   })();
 
   failures.delete(key);
@@ -281,7 +263,7 @@ authRouter.post("/password", requireAuth, async (req, res) => {
 });
 
 // Sign out everywhere else (lost phone, shared computer).
-authRouter.post("/logout-others", requireAuth, (req, res) => {
-  const result = db.prepare("DELETE FROM sessions WHERE user_id = ? AND id != ?").run(req.user.id, req.sessionId);
+authRouter.post("/logout-others", requireAuth, async (req, res) => {
+  const result = await db.prepare("DELETE FROM sessions WHERE user_id = ? AND id != ?").run(req.user.id, req.sessionId);
   res.json({ ok: true, signed_out: result.changes });
 });
